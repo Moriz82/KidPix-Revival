@@ -1,6 +1,8 @@
-//! QuickTime movies (Sorenson Video 1 + IMA4 on the CD). Decoded with an `ffmpeg`
-//! executable when one is available (the codec tables can't be bundled); frames are kept
-//! as RGB555 to stay small.
+//! QuickTime movies (Sorenson Video 1 + IMA4 on the CD), decoded natively by `kp-qt`
+//! with the Sorenson tables read from the user's own
+//! `INSTALL/QT4/QuickTime/QuickTimeAuthoring.qtx` (imported with the CD). Movies in other
+//! formats (or a missing `.qtx`) fall back to an `ffmpeg` executable when one is
+//! available. Frames are kept as RGB555 to stay small.
 
 use crate::gfx::Image;
 use mohawk::Sound;
@@ -34,6 +36,43 @@ impl Movie {
     pub fn duration(&self) -> f32 {
         self.frames.len() as f32 / self.fps.max(1.0)
     }
+}
+
+static GAME_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Where the imported CD lives (for the Sorenson tables in its `.qtx`).
+pub fn set_game_root(root: &Path) {
+    let _ = GAME_ROOT.set(root.to_path_buf());
+}
+
+/// The Sorenson Video tables, read once from the game's `QuickTimeAuthoring.qtx`.
+fn sorenson_tables() -> Option<&'static kp_qt::svq1::Tables> {
+    static T: std::sync::OnceLock<Option<kp_qt::svq1::Tables>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let root = GAME_ROOT.get()?;
+        let p = crate::assets::resolve_ci(root, "INSTALL/QT4/QuickTime/QuickTimeAuthoring.qtx")?;
+        match kp_qt::svq1::Tables::from_qtx_file(&p) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("{}: {e}", p.display());
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Native decode (Sorenson Video 1 + IMA4 / PCM).
+fn load_native(path: &Path) -> Result<Movie, String> {
+    let t = sorenson_tables().ok_or("QuickTimeAuthoring.qtx (Sorenson Video) is missing from the imported CD data")?;
+    let m = kp_qt::Movie::decode(path, t).map_err(|e| e.to_string())?;
+    if m.frames.is_empty() {
+        return Err("the movie has no pictures".into());
+    }
+    let to555 = |p: u32| (((p >> 19) & 31) << 10 | ((p >> 11) & 31) << 5 | ((p >> 3) & 31)) as u16;
+    let frames = m.frames.iter().map(|f| f.iter().map(|&p| to555(p)).collect()).collect();
+    let audio = (!m.audio.is_empty()).then(|| Sound { sample_rate: m.audio_rate, channels: m.audio_channels, samples: m.audio, loop_count: 0 });
+    Ok(Movie { width: m.width, height: m.height, fps: m.fps, frames, audio })
 }
 
 pub fn ffmpeg() -> Option<PathBuf> {
@@ -77,7 +116,15 @@ fn probe_size(ff: &Path, path: &Path) -> Option<(u32, u32, f32)> {
 
 /// Decode a movie fully (blocking). Use [`load_async`] from the UI.
 pub fn load(path: &Path) -> Result<Movie, String> {
-    let ff = ffmpeg().ok_or("Movies need ffmpeg (https://ffmpeg.org) installed or next to Kid Pix Revival.")?;
+    let native = load_native(path);
+    if native.is_ok() || ffmpeg().is_none() {
+        return native;
+    }
+    load_ffmpeg(path)
+}
+
+fn load_ffmpeg(path: &Path) -> Result<Movie, String> {
+    let ff = ffmpeg().ok_or("This movie format needs ffmpeg (https://ffmpeg.org) installed or next to Kid Pix Revival.")?;
     let (w, h, fps) = probe_size(&ff, path).ok_or("couldn't read the movie")?;
     let mut child = Command::new(&ff)
         .args(["-v", "error", "-i"])

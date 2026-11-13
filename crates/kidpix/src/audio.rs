@@ -5,6 +5,7 @@ use mohawk::Sound;
 use std::sync::{Arc, Mutex};
 
 struct Voice {
+    id: u64,
     sound: Arc<Sound>,
     /// Position in source frames (fractional).
     pos: f64,
@@ -110,6 +111,7 @@ impl Audio {
         let id = s.next_id;
         let step = sound.sample_rate as f64 / self.rate as f64;
         s.voices.push(Voice {
+            id,
             sound,
             pos: 0.0,
             step,
@@ -123,6 +125,15 @@ impl Audio {
         id
     }
 
+    /// Stop one sound started by `play`.
+    pub fn stop(&self, id: u64) {
+        self.shared.lock().unwrap().voices.retain(|v| v.id != id);
+    }
+
+    pub fn is_playing(&self, id: u64) -> bool {
+        self.shared.lock().unwrap().voices.iter().any(|v| v.id == id)
+    }
+
     pub fn stop_channel(&self, channel: u8) {
         self.shared
             .lock()
@@ -131,14 +142,6 @@ impl Audio {
             .retain(|v| v.channel != channel);
     }
 
-    pub fn channel_busy(&self, channel: u8) -> bool {
-        self.shared
-            .lock()
-            .unwrap()
-            .voices
-            .iter()
-            .any(|v| v.channel == channel)
-    }
 }
 
 fn mix<T: Copy>(shared: &Mutex<Shared>, out: &mut [T], channels: usize, conv: impl Fn(f32) -> T) {

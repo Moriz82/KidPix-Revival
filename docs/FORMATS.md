@@ -17,7 +17,7 @@ the engine reads the user's own copy at runtime.
     (also Mohawk archives).
   * `Idea Machine/*.kpx` – sample pictures (Mohawk archives, see below).
   * `INSTALL/Fonts/*.TTF` – fonts installed by the original setup.
-  * `QTmovies/*.mov` – QuickTime movies (not supported yet).
+  * `QTmovies/*.mov` – QuickTime movies: Sorenson Video 1 + IMA4 (see "QuickTime movies").
   * `Data/Quicktimefx/*.qfx` – QuickTime transition effects (not Mohawk).
   * `KpInstall/KPD3.exe` – the original Win32 program (reference only).
 
@@ -50,7 +50,7 @@ file table (D + file table offset):
 | `tBMP` | single bitmap (see *Bitmaps*) |
 | `tBMH` | bitmap set: `u16 count, u16 ?, u16 ?, u16 setFormat, count x u32 offset`; each entry is a bitmap. If `setFormat & 0xf00 == 0x100` everything after the 8-byte header is LZ-packed and the offsets are relative to (header + unpacked data). The original program only accepts packing 0x000, 0x100, 0x200 (LZ with a 14-byte header) and 0xf00 (plug-in codecs such as JPEG); anything else — including the `0x400` sets in the 1999 `MainTools.MHK` and `Icons.MHK` 2350 — makes it return error 0x2a63, so those two sets are unused leftovers. |
 | `tPAL` | palette: `u16 first, u16 count, count x {r,g,b,pad}` |
-| `tCNT` | `u16 baseId, u16 count` (e.g. 1000/238: the tBMH 1000 has 237 cels, REGS have 238 entries) |
+| `tCNT` | `u16 baseId, u16 count` (e.g. 1000/238: the tBMH 1000 has 237 cels, REGS have 238 entries). The extra cel `count` is the standalone `tBMP baseId` (splash still, easel backdrop); it has no registration point and is drawn at the script's top-left. |
 | `REGS` | registration points. Two REGS per tBMH: `REGS id` = x array, `REGS id+1` = y array; `i16` per cel, index = cel number (1-based, entry 0 unused) |
 | `tSCR` | animation script (see *Scripts*) |
 | `MBTN` | button table (see *Buttons*) |
@@ -122,7 +122,8 @@ copy from `out[-((insertPos - pos) & 0x3ff)]`.
   0x04 len 4  : u16 tempo (always 100)
   0x03 len 6  : u16 sound index, u16 flag  – plays a tWAV of the same archive
   0x10 n      : FRAME – here the 2nd byte is a COUNT n, followed by n x
-                { u16 cel | 0x8000, i16 x, i16 y }   (bit 15 set = draw)
+                { u16 cel [| 0x8000], i16 x, i16 y }   (bit 15 is NOT a visibility flag: cels
+                                                       without it are drawn too, e.g. Splash 1000, RFlattenDlg labels)
   0x01 len 2  : show frame / wait one tick
   0x00 len 2  : end
 ```
@@ -214,6 +215,76 @@ Plain INI text shipped on the CD; the engine parses them at runtime.
   Values may carry a trailing `;` and `//` comments.
 * `KPD3.ini` `[CanvasSettings]`: `easelLeft 112, easelTop 48, easelWidth 600,
   easelHeight 452`; `[PageObjectLimits] SWFMax 15` (max stickers per page).
+
+## QuickTime movies (`QTmovies/*.mov`)
+
+12 movies, 320×240, 15 fps, Sorenson Video 1 (`SVQ1`) and, in 9 of them, IMA 4:1 ADPCM
+stereo 44.1 kHz (`ima4`). Reader: `crates/kp-qt` (verified bit-exact against ffmpeg).
+
+* **Container:** `moov/trak/mdia` with `mdhd` (time scale), `hdlr` (`vide`/`soun`),
+  `minf/stbl`: `stsd` (format, size / channels / rate), `stco`, `stsc`, `stsz`, `stts`.
+  Video samples are frames; sound chunks hold `stsc` sample frames each.
+* **IMA4:** per channel per 64 samples a 34-byte packet: big-endian header (top 9 bits
+  predictor, low 7 bits step index), 32 bytes of nibbles (low first); channels alternate.
+  Apple's decoder keeps its running predictor when the header's index matches and its
+  predictor is within 0x7f of it (the header is only 9-bit precise).
+* **SVQ1 tables** (read at runtime from `INSTALL/QT4/QuickTime/QuickTimeAuthoring.qtx`,
+  the Sorenson Video R2.0 *compressor*; VA `0x66ebd444`): 16 serialised code tables
+  (`i32 count, i32 first symbol, count × u32 (length << 27 | code)`) in this order: inter
+  mean (512, −256..255), intra mean (256), motion difference (64, value + 32: magnitude
+  code then sign bit), block type (4: `01` inter, `001` four vectors, `000` intra, `1`
+  skip), intra stage count per level 5..0, inter stage count per level 5..0 (symbol =
+  stages + 1, 0 = no vector). Directly after (`@0x66e03800`): codebooks for levels 3, 2,
+  1, 0 (8×8, 8×4, 4×4, 4×2), each an intra then an inter book of 6 stages × 16 vectors,
+  values stored `+128`, every vector as 4×4 tiles left→right, top→bottom, each tile row by
+  row. Frame-size table at VA `0x66ebd248`.
+* **Frame:** 22-bit picture code (0x20; other codes scramble words 1–4 and add a
+  checksum / message), 8-bit temporal reference, 2-bit type (0 key, 1 delta, 2 droppable
+  delta); key frames: 5 unknown bits, 3-bit size code (7 = 12-bit width and height); two
+  optional flag groups. Then Y, U, V planes (U/V a quarter size each way, padded to 16) in
+  16×16 macroblocks.
+* **Vectors:** a breadth-first binary tree from 16×16 (level 5) down to 4×2 (level 0),
+  odd levels split top/bottom, even ones left/right; one split bit per node above level 0.
+  A leaf: stage-count code (−1 = leave as is / zero), mean code, `4 × stages` bits of
+  codebook indices (stage j uses vectors 16j…16j+15); pixel = clamp(mean + Σ vectors)
+  (delta: added to the prediction). Levels 4 and 5 carry means only.
+* **Delta macroblocks:** skip (copy), inter (one half-pel vector), four vectors (8×8
+  each), intra. Vectors are horizontal then vertical difference added to the median of
+  three predictors (left, above, above-right in a row array; TR uses TL; BL uses TL, TR
+  and the left block's; BR uses BL, TR, TL), wrapped to 6 bits, then clipped to the
+  plane; half-pel by rounding averages.
+
+## Spelling lexicon (`KpInstall/usa86.lex` + `engphon.env`)
+
+Franklin / Proximity Technology word list used by *Check Spelling* (decoded from the
+spell engine in KPD3.exe; reader: `crates/kp-lex`). 101,996 entries.
+
+**`engphon.env`** (phonetic rule set). Byte 0 = version (1 → rule outputs start at 10,
+else 16). 16 u16 LE at offset 4: `h0` bins (170), `h1` letter codes (58), `h2` first bin
+byte (12), `h3` bins per first byte (46), `h5` trie size (159), `h6` offset of the
+3-letter rules (35), `h7` bin-string bytes (919), `h8` letter table bytes (116), `h15`
+rule bytes (151). From offset 36: `h7` bytes of NUL-separated, sorted phonetic class
+strings (the bins); `h8` bytes of (letter, class) pairs, one per letter code (letter 9 =
+double the previous letter, 11 = silent); 3×256 character tables; the double-array trie
+(`base`, `check`, `output`, `h5` bytes each, symbols = char − 88, `output` 127 = no
+rule); `h15` bytes of rule outputs (literal strings when ≥ 0x41, else class bytes).
+
+A word's **bin** is found by transcribing `Y` + word + `Z` with longest trie matches into
+(letter, class) pairs, collecting classes 17–31 (dropping repeats and classes 24/30/31,
+keeping every 25), and taking the last bin string ≤ that class string: bin index *k* →
+bytes (`k / h3 + h2`, `k % h3 + h2`).
+
+**`usa86.lex`**. 7 u16 LE at 0x102: version, flags, sub, `ntok`, `ndig`, `nblk`, `slen`.
+At 0x110: `ntok` drop counts, `ndig` 2-byte digraphs, then `slen` bytes of
+NUL-separated strings: `ntok` suffix tokens followed by `nblk` block keys. Block *i* is
+1024 bytes at (5 + *i*) × 1024; its first entry is its key, the rest start at byte 7 and
+are front-coded: a byte ≥ `h1 + 16` appends token *k* (after dropping `drop[k]` bytes),
+a byte in `h1 … h1 + 15` drops that many − `h1` trailing bytes (`h1 + 15` takes a second
+count byte), then the tail follows: letter codes < `h1`, digraph codes, `4` + literal
+spelling (up to the next 0xFF), and `0xFF flag` pairs; 0 ends the block. Every entry =
+2 bin bytes + letter codes. Flags: 1 known misspelling (literal = correction), 2 proper
+noun, 3 acronym, 5/6/9/0x14 abbreviations, 7 single letter, 0x10 exact spelling in the
+literal. Literal bytes ≥ 0x80 are code page 437 (accented letters).
 
 ## KPD3.exe structure (from RTTI, REA `inspect_pe_resources` + r2 strings)
 

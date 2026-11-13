@@ -1,0 +1,9 @@
+[package]
+name = "kp-lex"
+description = "Reader for the Franklin/Proximity spelling lexicon on the Kid Pix Deluxe 3 CD (usa86.lex + engphon.env)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

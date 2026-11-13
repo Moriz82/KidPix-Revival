@@ -1304,7 +1304,11 @@ dependencies = [
  "fontdue",
  "gif",
  "jpeg-encoder",
+ "kp-brushes",
  "kp-import",
+ "kp-kpx",
+ "kp-lex",
+ "kp-qt",
  "kp-swf",
  "miniz_oxide 0.8.9",
  "mohawk",
@@ -1316,11 +1320,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "kp-brushes"
+version = "0.1.0"
+dependencies = [
+ "fontdue",
+ "mohawk",
+ "png",
+]
+
+[[package]]
 name = "kp-import"
 version = "0.1.0"
 dependencies = [
  "zip",
 ]
+
+[[package]]
+name = "kp-kpx"
+version = "0.1.0"
+dependencies = [
+ "jpeg-encoder",
+ "mohawk",
+ "png",
+]
+
+[[package]]
+name = "kp-lex"
+version = "0.1.0"
+
+[[package]]
+name = "kp-qt"
+version = "0.1.0"
 
 [[package]]
 name = "kp-swf"

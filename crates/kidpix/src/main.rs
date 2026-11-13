@@ -6,11 +6,14 @@ mod assets;
 mod audio;
 mod buttons;
 mod colorpicker;
+mod dialogs;
 mod easel;
 mod gfx;
+mod helpkeys;
 mod importer;
 mod fills;
 mod formats;
+mod kpxio;
 mod library;
 mod menubar;
 mod mixer;
@@ -18,21 +21,30 @@ mod movie;
 mod objects;
 mod paint;
 mod panels;
+mod picker;
 mod print;
 mod record;
 mod regions;
 mod selftest;
 mod setup;
+mod shell;
+mod slideplay;
 mod slideshow;
 mod speech;
+mod spell;
+mod stampedit;
 mod stickers;
+mod textbox;
 mod tools;
+mod win32;
 mod trays;
 mod ui;
+mod uifont;
 
 use assets::Assets;
 use audio::Audio;
 use easel::{Action, CursorHint, Easel};
+use shell::Shell;
 use gfx::Image;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -48,22 +60,16 @@ use winit::window::{CursorIcon, Window, WindowId};
 const W: u32 = 800;
 const H: u32 = 600;
 
-struct Splash {
-    image: Rc<Image>,
-    left_ms: f32,
-}
-
 struct Running {
     window: Rc<Window>,
     surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
     _context: softbuffer::Context<Rc<Window>>,
-    easel: Easel,
+    shell: Shell,
     frame: Image,
     last: Instant,
     view: (f32, f32, f32),
     modifiers: ModifiersState,
     save_path: Option<PathBuf>,
-    splash: Option<Splash>,
     cursor: Option<(CursorHint, u32)>,
     mouse: (i32, i32),
     cursors: std::collections::HashMap<(u16, u32), winit::window::CustomCursor>,
@@ -82,34 +88,23 @@ impl ApplicationHandler for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("Kid Pix Revival")
+            .with_title("Kid Pix Deluxe 3") // string table 128
             .with_inner_size(LogicalSize::new(W as f64 * 1.25, H as f64 * 1.25))
             .with_min_inner_size(LogicalSize::new(W as f64 / 2.0, H as f64 / 2.0));
         let window = Rc::new(el.create_window(attrs).expect("create window"));
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let surface = softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
-        let easel = Easel::new(self.assets.clone(), self.audio.clone());
-        let splash = self.assets.image("Data/Splash.MHK", 1000).map(|image| {
-            if let Some(a) = self.assets.archive("Data/Splash.MHK") {
-                if let Some(&id) = a.ids(assets::T_WAV).first() {
-                    if let Some(s) = self.assets.sound("Data/Splash.MHK", id) {
-                        self.audio.play(s, audio::CH_MUSIC, false);
-                    }
-                }
-            }
-            Splash { image, left_ms: 3000.0 }
-        });
+        let shell = Shell::new(self.assets.clone(), self.audio.clone(), true);
         self.run = Some(Running {
             window,
             surface,
             _context: context,
-            easel,
+            shell,
             frame: Image::new(W, H),
             last: Instant::now(),
             view: (0.0, 0.0, 1.0),
             modifiers: ModifiersState::empty(),
             save_path: None,
-            splash,
             cursor: None,
             mouse: (0, 0),
             cursors: Default::default(),
@@ -121,8 +116,11 @@ impl ApplicationHandler for App {
         let Some(r) = self.run.as_mut() else { return };
         match event {
             WindowEvent::CloseRequested => {
-                if confirm_discard(&r.easel) {
+                if r.shell.busy() {
+                    r.shell.save_prefs();
                     el.exit();
+                } else {
+                    r.shell.request_quit();
                 }
             }
             WindowEvent::Resized(_) => r.window.request_redraw(),
@@ -130,20 +128,13 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let (x, y) = to_logical(r.view, position);
                 r.mouse = (x, y);
-                r.easel.mouse_move(x, y);
+                r.shell.mouse_move(x, y);
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                if r.splash.is_some() {
-                    if state == ElementState::Pressed {
-                        r.splash = None;
-                        self.audio.stop_channel(audio::CH_MUSIC);
-                    }
-                    return;
-                }
                 let (x, y) = r.mouse;
                 match state {
-                    ElementState::Pressed => r.easel.mouse_down(x, y),
-                    ElementState::Released => r.easel.mouse_up(x, y),
+                    ElementState::Pressed => r.shell.mouse_down(x, y),
+                    ElementState::Released => r.shell.mouse_up(x, y),
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -151,26 +142,65 @@ impl ApplicationHandler for App {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                     winit::event::MouseScrollDelta::PixelDelta(p) => (p.y / 40.0) as f32,
                 };
-                r.easel.wheel(steps);
+                if !r.shell.busy() {
+                    r.shell.wheel(steps);
+                }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let ctrl = r.modifiers.control_key() || r.modifiers.super_key();
+                let dk = match &event.logical_key {
+                    Key::Named(NamedKey::Backspace) => Some(dialogs::Key::Back),
+                    Key::Named(NamedKey::Delete) => Some(dialogs::Key::Delete),
+                    Key::Named(NamedKey::ArrowLeft) => Some(dialogs::Key::Left),
+                    Key::Named(NamedKey::ArrowRight) => Some(dialogs::Key::Right),
+                    Key::Named(NamedKey::Enter) => Some(dialogs::Key::Enter),
+                    Key::Named(NamedKey::Escape) => Some(dialogs::Key::Escape),
+                    Key::Named(NamedKey::PageUp) => Some(dialogs::Key::PageUp),
+                    Key::Named(NamedKey::PageDown) => Some(dialogs::Key::PageDown),
+                    Key::Named(NamedKey::Space) => Some(dialogs::Key::Char(' ')),
+                    _ => event.text.as_ref().and_then(|t| t.chars().next()).filter(|c| !c.is_control()).map(dialogs::Key::Char),
+                };
+                let other_screen = r.shell.screen != shell::Screen::Easel;
+                if ctrl && other_screen && !r.shell.busy() {
+                    // Picker accelerators (Ctrl+S save, Ctrl+Q exit, Ctrl+X/C/V slides).
+                    if let Key::Character(s) = &event.logical_key {
+                        if let Some(id) = s.chars().next().and_then(menubar::accelerator) {
+                            r.shell.menu_command(id);
+                        }
+                    }
+                    self.handle_actions(el);
+                    return;
+                }
+                if let Some(k) = dk {
+                    if r.shell.key(k) {
+                        self.handle_actions(el);
+                        return;
+                    }
+                }
+                if other_screen {
+                    r.shell.other_key();
+                    self.handle_actions(el);
+                    return;
+                }
+                let easel = &mut r.shell.easel;
                 match &event.logical_key {
                     Key::Character(s) if ctrl => {
                         // The original accelerator table (Ctrl+C/Q/S/V/X/Z).
                         if let Some(id) = s.chars().next().and_then(menubar::accelerator) {
-                            r.easel.menu_command(id);
+                            easel.menu_command(id);
                         }
                     }
-                    Key::Named(NamedKey::Escape) => r.easel.key_escape(),
-                    Key::Named(NamedKey::Delete) => r.easel.delete_under_mouse(),
-                    Key::Named(NamedKey::Backspace) => r.easel.key_char('\u{8}'),
-                    Key::Named(NamedKey::Enter) => r.easel.key_char('\n'),
-                    Key::Named(NamedKey::Space) => r.easel.key_char(' '),
+                    Key::Named(NamedKey::Escape) => easel.key_escape(),
+                    Key::Named(NamedKey::Delete) => easel.delete_under_mouse(),
+                    Key::Named(NamedKey::ArrowLeft) => easel.key_char('\u{1c}'),
+                    Key::Named(NamedKey::ArrowRight) => easel.key_char('\u{1d}'),
+                    Key::Named(NamedKey::Backspace) => easel.key_char('\u{8}'),
+                    Key::Named(NamedKey::Enter) => easel.key_char('\n'),
+                    Key::Named(NamedKey::Space) => easel.key_char(' '),
                     _ => {
                         if let Some(t) = &event.text {
                             for c in t.chars() {
-                                r.easel.key_char(c);
+                                easel.key_char(c);
                             }
                         }
                     }
@@ -181,30 +211,17 @@ impl ApplicationHandler for App {
                 let dt = (now - r.last).as_secs_f32() * 1000.0;
                 r.last = now;
                 let dt = dt.min(100.0);
-                if let Some(s) = r.splash.as_mut() {
-                    s.left_ms -= dt;
-                    if s.left_ms <= 0.0 {
-                        r.splash = None;
-                    }
-                }
                 if let Some(rx) = &r.movie_rx {
                     if let Ok(res) = rx.try_recv() {
                         r.movie_rx = None;
                         match res {
-                            Ok(m) => r.easel.add_movie(m),
-                            Err(e) => r.easel.message(e),
+                            Ok(m) => r.shell.easel.add_movie(m),
+                            Err(e) => r.shell.easel.alert(e),
                         }
                     }
                 }
-                r.easel.update(dt);
-                match &r.splash {
-                    Some(s) => {
-                        r.frame.pixels.fill(0xff00_0000);
-                        let (x, y) = ((W as i32 - s.image.width as i32) / 2, (H as i32 - s.image.height as i32) / 2);
-                        gfx::blit(&mut r.frame, &s.image, x, y);
-                    }
-                    None => r.easel.draw(&mut r.frame),
-                }
+                r.shell.update(dt);
+                r.shell.draw(&mut r.frame);
                 r.present();
                 r.update_cursor(el, &self.assets);
             }
@@ -224,75 +241,101 @@ impl ApplicationHandler for App {
 impl App {
     fn handle_actions(&mut self, el: &ActiveEventLoop) {
         let Some(r) = self.run.as_mut() else { return };
-        let actions: Vec<Action> = std::mem::take(&mut r.easel.actions);
+        if r.shell.quit {
+            r.shell.save_prefs();
+            el.exit();
+            return;
+        }
+        r.shell.pump();
+        let actions: Vec<Action> = r.shell.take_actions();
+        let mut abort = false;
         for a in actions {
+            if abort {
+                break;
+            }
+            let pictures = r.shell.easel.user_pictures.clone();
+            let r_easel = &mut r.shell.easel;
             match a {
-                Action::Save | Action::SaveAs => {
+                Action::Save | Action::SaveAs | Action::SaveTo(_) => {
                     let path = match (&a, &r.save_path) {
+                        (Action::SaveTo(p), _) => Some(p.clone()),
                         (Action::Save, Some(p)) => Some(p.clone()),
-                        _ => rfd::FileDialog::new()
-                            .set_title("Save your picture")
-                            .add_filter("PNG picture", &["png"])
-                            .set_file_name("My Picture.png")
-                            .save_file(),
+                        _ => {
+                            // Kid Pix pictures, or (a Kid Pix Revival addition) a plain image.
+                            let mut d = rfd::FileDialog::new()
+                                .set_title("Save Picture As")
+                                .add_filter("Kid Pix Picture (*.kpx)", &["kpx"])
+                                .add_filter("PNG Image (*.png)", &["png"])
+                                .add_filter("JPEG Image (*.jpg)", &["jpg", "jpeg"])
+                                .add_filter("Bitmap Image (*.bmp)", &["bmp"])
+                                .set_file_name("Untitled.kpx");
+                            if let Some(dir) = pictures.as_ref().filter(|d| d.is_dir()) {
+                                d = d.set_directory(dir);
+                            }
+                            d.save_file()
+                        }
                     };
+                    if path.is_none() {
+                        abort = true;
+                    }
                     if let Some(mut p) = path {
                         if p.extension().is_none() {
-                            p.set_extension("png");
+                            p.set_extension("kpx");
                         }
-                        let img = r.easel.flattened();
-                        match save_png(&p, &img) {
+                        let res = save_picture(r_easel, &p);
+                        match res {
                             Ok(()) => {
-                                r.easel.canvas.dirty = false;
-                                r.easel.message(format!("Saved {}", p.file_name().unwrap_or_default().to_string_lossy()));
+                                r_easel.canvas.dirty = false;
                                 r.save_path = Some(p);
                             }
-                            Err(e) => r.easel.message(format!("Couldn't save: {e}")),
+                            Err(e) => {
+                                abort = true;
+                                r_easel.alert(format!("Couldn't save the picture: {e}"));
+                            }
                         }
                     }
                 }
                 Action::Open => {
-                    if !confirm_discard(&r.easel) {
+                    if !true {
                         continue;
                     }
                     let mut dlg = rfd::FileDialog::new()
                         .set_title("Open a picture")
                         .add_filter("Pictures", &["png", "kpx", "PNG", "KPX"]);
-                    if let Some(p) = self.assets.path("Idea Machine") {
+                    if let Some(p) = pictures.clone().filter(|d| d.is_dir()).or_else(|| self.assets.path("Idea Machine")) {
                         dlg = dlg.set_directory(p);
                     }
                     if let Some(p) = dlg.pick_file() {
-                        match load_picture(&p) {
-                            Some(img) => {
-                                r.easel.load_picture(img);
-                                r.save_path = p
-                                    .extension()
-                                    .is_some_and(|e| e.eq_ignore_ascii_case("png"))
-                                    .then(|| p.clone());
-                            }
-                            None => r.easel.message("Couldn't open that picture."),
+                        if open_page(r_easel, &p) {
+                            r.save_path = Some(p.clone());
                         }
                     }
                 }
                 Action::New => {
-                    if confirm_discard(&r.easel) {
-                        r.easel.new_picture();
+                    if true {
+                        r_easel.new_picture();
                         r.save_path = None;
                     }
                 }
                 Action::Export => {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .set_title("Export your picture")
-                        .add_filter("JPEG picture", &["jpg"])
-                        .add_filter("BMP picture", &["bmp"])
-                        .add_filter("PNG picture", &["png"])
-                        .set_file_name("My Picture.jpg")
-                        .save_file()
-                    {
-                        let img = r.easel.flattened();
+                    let name = r.save_path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".into());
+                    let mut dlg = rfd::FileDialog::new()
+                        .set_title("Export Picture")
+                        .add_filter("PNG Image (*.png)", &["png"])
+                        .add_filter("JPEG Image (*.jpg)", &["jpg", "jpeg"])
+                        .add_filter("Bitmap Image (*.bmp)", &["bmp"])
+                        .set_file_name(format!("{name}.png"));
+                    if let Some(dir) = pictures.as_ref().filter(|d| d.is_dir()) {
+                        dlg = dlg.set_directory(dir);
+                    }
+                    if let Some(mut p) = dlg.save_file() {
+                        if p.extension().is_none() {
+                            p.set_extension("png");
+                        }
+                        let img = r_easel.flattened();
                         match formats::export(&img, &p) {
-                            Ok(()) => r.easel.message("Exported your picture."),
-                            Err(e) => r.easel.message(format!("Couldn't export: {e}")),
+                            Ok(()) => {}
+                            Err(e) => r_easel.alert(format!("Couldn't export the picture: {e}")),
                         }
                     }
                 }
@@ -303,24 +346,24 @@ impl App {
                         .pick_file()
                     {
                         match formats::load_image(&p) {
-                            Ok(img) => r.easel.import_picture(
+                            Ok(img) => r_easel.import_picture(
                                 img,
                                 if a == Action::AddGraphic { easel::FitTarget::Graphic } else { easel::FitTarget::Background },
                             ),
-                            Err(e) => r.easel.message(e),
+                            Err(e) => r_easel.alert(e),
                         }
                     }
                 }
                 Action::ImportSound => {
                     if let Some(p) = rfd::FileDialog::new().set_title("Import Sound").add_filter("WAV sound", &["wav", "WAV"]).pick_file() {
                         match formats::load_wav(&p) {
-                            Ok(s) => r.easel.set_page_sound(std::sync::Arc::new(s)),
-                            Err(e) => r.easel.message(e),
+                            Ok(s) => r_easel.set_page_sound(std::sync::Arc::new(s)),
+                            Err(e) => r_easel.alert(e),
                         }
                     }
                 }
                 Action::IdeaMachine => {
-                    if !confirm_discard(&r.easel) {
+                    if !true {
                         continue;
                     }
                     let mut dlg = rfd::FileDialog::new().set_title("Idea Machine").add_filter("Kid Pix picture", &["kpx", "KPX"]);
@@ -328,9 +371,9 @@ impl App {
                         dlg = dlg.set_directory(p);
                     }
                     if let Some(p) = dlg.pick_file() {
-                        match load_picture(&p) {
-                            Some(img) => r.easel.load_picture(img),
-                            None => r.easel.message("Couldn't open that picture."),
+                        // An Idea Machine page opens as a new, untitled picture.
+                        if open_page(r_easel, &p) {
+                            r.save_path = None;
                         }
                     }
                 }
@@ -339,11 +382,10 @@ impl App {
                         let opener = if cfg!(target_os = "macos") { "open" } else if cfg!(windows) { "explorer" } else { "xdg-open" };
                         let _ = std::process::Command::new(opener).arg(p).spawn();
                     }
-                    None => r.easel.message("The User Guide wasn't found in your Kid Pix files."),
+                    None => r_easel.alert("The User Guide wasn't found in your Kid Pix files."),
                 },
-                Action::Login | Action::EditAbcText | Action::CheckSpelling | Action::SayItThisWay | Action::StampEditor => {
-                    r.easel.dialog_action(a.clone());
-                }
+                // Handled by the shell's graphical dialogs (Check Spelling is unavailable).
+                Action::Login | Action::EditAbcText | Action::CheckSpelling | Action::SayItThisWay => {}
                 Action::AddMovie => {
                     let mut dlg = rfd::FileDialog::new()
                         .set_title("Add a movie")
@@ -352,37 +394,39 @@ impl App {
                         dlg = dlg.set_directory(p);
                     }
                     if let Some(p) = dlg.pick_file() {
-                        r.easel.message("Getting the movie ready...");
                         r.movie_rx = Some(movie::load_async(p));
                     }
                 }
-                Action::Print => {
-                    let img = r.easel.flattened();
-                    match print::print(&img) {
-                        Ok(_) => r.easel.message("Sent your picture to the printer."),
-                        Err(e) => r.easel.message(format!("Couldn't print: {e}")),
-                    }
-                }
-                Action::SlideAddFile => {
-                    let mut dlg = rfd::FileDialog::new()
-                        .set_title("Add a picture to the slide show")
-                        .add_filter("Pictures", &["png", "kpx", "PNG", "KPX"]);
-                    if let Some(p) = self.assets.path("Idea Machine") {
-                        dlg = dlg.set_directory(p);
-                    }
-                    if let Some(files) = dlg.pick_files() {
-                        for p in files {
-                            if let Some(img) = load_picture(&p) {
-                                r.easel.slideshow_add(img);
-                            }
-                        }
+                Action::PrintPoster(n) => {
+                    let img = r_easel.flattened();
+                    match print::print_mode(&img, n) {
+                        Ok(_) => {}
+                        Err(e) => r_easel.alert(format!("Couldn't print: {e}")),
                     }
                 }
                 Action::Quit => {
-                    if confirm_discard(&r.easel) {
-                        el.exit();
+                    r.shell.save_prefs();
+                    el.exit();
+                }
+                Action::GoSlideShow => r.shell.enter_picker(),
+                Action::EmailSend { movie } => {
+                    // The Kid Pix Email web service is gone: save the picture (JPEG) or the
+                    // whole page (.kpx), then open the mail program and the file's folder.
+                    let dir = pictures.clone().unwrap_or_else(std::env::temp_dir).join("Email");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let name = r.save_path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "My Picture".into());
+                    let file = dir.join(format!("{name}.{}", if movie { "kpx" } else { "jpg" }));
+                    let saved = if movie { save_picture(r_easel, &file) } else { formats::export(&r_easel.flattened(), &file) };
+                    match saved {
+                        Ok(()) => {
+                            let opener = if cfg!(target_os = "macos") { "open" } else if cfg!(windows) { "explorer" } else { "xdg-open" };
+                            let _ = std::process::Command::new(opener).arg("mailto:?subject=A%20Kid%20Pix%20picture%20for%20you&body=I%20made%20this%20picture%20with%20Kid%20Pix!").spawn();
+                            let _ = std::process::Command::new(opener).arg(&dir).spawn();
+                        }
+                        Err(e) => r_easel.alert(format!("Couldn't save the picture to send: {e}")),
                     }
                 }
+                Action::Help | Action::Flatten(_) | Action::SaveRecording | Action::EmailSetup => {}
             }
         }
     }
@@ -403,7 +447,7 @@ impl Running {
     }
 
     fn update_cursor(&mut self, el: &ActiveEventLoop, assets: &Assets) {
-        let hint = self.easel.cursor_hint();
+        let hint = self.shell.cursor_hint();
         // Original cursors are 16x16; scale them with the window (at least 2x like the
         // 800x600 original on today's screens).
         let scale = (self.view.2 * self.window.scale_factor() as f32).round().clamp(1.0, 4.0) as u32;
@@ -453,18 +497,47 @@ fn to_logical(view: (f32, f32, f32), p: PhysicalPosition<f64>) -> (i32, i32) {
     )
 }
 
-fn confirm_discard(easel: &Easel) -> bool {
-    if !easel.canvas.dirty {
-        return true;
+/// Save the picture by extension: `.kpx` (the Kid Pix format, plus a PNG copy next to it
+/// when Controls > PNG Copy is on), or a plain `.png` / `.jpg` / `.bmp` image of the whole
+/// picture with its stickers and text (a Kid Pix Revival addition).
+pub fn save_picture(easel: &mut Easel, p: &Path) -> Result<(), String> {
+    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "bmp") {
+        let img = easel.flattened();
+        return formats::export(&img, p);
     }
-    matches!(
-        rfd::MessageDialog::new()
-            .set_title("Kid Pix Revival")
-            .set_description("Your picture has changes that aren't saved. Throw them away?")
-            .set_buttons(rfd::MessageButtons::YesNo)
-            .show(),
-        rfd::MessageDialogResult::Yes
-    )
+    let page = easel.to_kpx();
+    kpxio::write(&page, p)?;
+    easel.kpx_base = kpxio::read(p).ok();
+    if easel.menu_state.png_copy {
+        let img = easel.flattened();
+        save_png(&p.with_extension("png"), &img).map_err(|e| format!("Couldn't save the PNG copy: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Open a `.kpx` page (stickers, text, sound) or a plain picture into the easel.
+fn open_page(easel: &mut Easel, p: &Path) -> bool {
+    if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("kpx")) {
+        match kpxio::read(p) {
+            Ok(page) => {
+                easel.load_kpx(page);
+                return true;
+            }
+            Err(e) => eprintln!("kpx: {e}"),
+        }
+    }
+    match load_picture(p) {
+        Some(img) => {
+            easel.load_picture(img);
+            true
+        }
+        None => {
+            let t = easel.ini_text("FileStrings", "CantOpenPictureFile", "Can't open the picture file, %s.").replace("%s", &p.file_name().unwrap_or_default().to_string_lossy());
+            easel.alert(t);
+            false
+        }
+    }
 }
 
 pub fn save_png(path: &Path, img: &Image) -> Result<(), String> {
@@ -543,7 +616,39 @@ fn main() {
         None => return,
     };
     eprintln!("Using Kid Pix data from {}", root.display());
+    movie::set_game_root(&root);
     let assets = Rc::new(Assets::new(root));
+    // Debug: render scripts to a PNG: --dump-script <archive> <out.png> <id>...
+    if let Some(i) = args.iter().position(|a| a == "--dump-script") {
+        let arch = &args[i + 1];
+        let out = PathBuf::from(&args[i + 2]);
+        let mut frame = Image::filled(W, H, 0xff80_8080);
+        for a in &args[i + 3..] {
+            if let Some(b) = a.strip_prefix('b').and_then(|b| b.parse::<u16>().ok()) {
+                if let Some(img) = assets.image(arch, b) {
+                    gfx::blit(&mut frame, &img, 0, 0);
+                }
+            }
+        }
+        for id in args[i + 3..].iter().filter_map(|a| a.parse::<u16>().ok()) {
+            match anim::Player::new(&assets, arch, id) {
+                Some(mut p) => {
+                    p.finish_now();
+                    for (cel, _, _) in p.placed() {
+                        if let Some(img) = p.sprites.cel(cel) {
+                            let mask = img.pixels.iter().all(|px| px & 0x00ff_ffff == 0);
+                            eprintln!("  cel {cel}: {}x{} {}", img.width, img.height, if mask { "8-bit mask" } else { "colour" });
+                        }
+                    }
+                    eprintln!("{id}: bounds {:?} cels {:?} set: {} cels, regs {}/{}, last cel size {:?} regs_tail {:?} {:?}", p.bounds(), p.placed(), p.sprites.cels.len(), p.sprites.reg_x.len(), p.sprites.reg_y.len(), p.sprites.cels.last().map(|c| (c.width, c.height)), &p.sprites.reg_x[p.sprites.reg_x.len().saturating_sub(4)..], &p.sprites.reg_y[p.sprites.reg_y.len().saturating_sub(4)..]);
+                    p.draw(&mut frame);
+                }
+                None => eprintln!("{id}: missing"),
+            }
+        }
+        save_png(&out, &frame).expect("png");
+        return;
+    }
     if let Some(out) = render_test {
         selftest::run(assets, &out);
         return;

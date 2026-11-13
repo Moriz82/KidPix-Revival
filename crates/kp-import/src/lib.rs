@@ -98,7 +98,8 @@ pub fn wanted(rel: &str) -> bool {
     match top {
         "data" => !l.starts_with("data/players/"),
         "libraries" | "idea machine" | "qtmovies" => true,
-        "install" => l.starts_with("install/fonts/"),
+        // fonts, and the Sorenson Video compressor whose tables decode the movies
+        "install" => l.starts_with("install/fonts/") || l == "install/qt4/quicktime/quicktimeauthoring.qtx",
         "kpinstall" => l.ends_with(".cfg") || l.ends_with(".ini") || l.ends_with(".lex") || l.ends_with(".env") || l.ends_with(".pdf"),
         _ => l == "read me.txt",
     }
@@ -446,6 +447,8 @@ mod tests {
         assert!(wanted("KpInstall/KPD3.cfg"));
         assert!(!wanted("KpInstall/KPD3.exe"));
         assert!(!wanted("INSTALL/SETUP32.EXE"));
+        assert!(wanted("INSTALL/QT4/QuickTime/QuickTimeAuthoring.qtx"));
+        assert!(!wanted("INSTALL/QT4/QuickTimeInstallCache.qdat"));
         assert!(!wanted("AOL/setup.exe"));
         assert!(!wanted("Data/Players/SwFlsh32.exe"));
     }

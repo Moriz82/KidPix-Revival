@@ -3,7 +3,6 @@
 //! the union of the rectangles being the shape.
 
 use crate::assets::Assets;
-use crate::gfx::Image;
 
 pub const CUT_ARCHIVE: &str = "Data/Tools/CutRgns.MHK";
 
@@ -43,9 +42,6 @@ impl Region {
         x >= 0 && y >= 0 && (x as u32) < self.width && (y as u32) < self.height && self.mask[(y as u32 * self.width + x as u32) as usize]
     }
 
-    pub fn to_image(&self, color: u32) -> Image {
-        Image { width: self.width, height: self.height, pixels: self.mask.iter().map(|&m| if m { color } else { 0 }).collect() }
-    }
 }
 
 pub fn load(assets: &Assets, id: u16) -> Option<Region> {

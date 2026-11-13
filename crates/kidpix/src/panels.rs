@@ -30,6 +30,8 @@ pub struct Panel {
     pub layout: Layout,
     bg: Option<Player>,
     pub buttons: Vec<UiButton>,
+    /// Buttons not shown (e.g. the audio panel's record-mode group).
+    pub hidden: Vec<bool>,
     row: Option<Player>,
     sel_frames: Vec<Player>,
     hover_frames: Vec<Player>,
@@ -50,7 +52,7 @@ fn synthetic(assets: &Assets, cmd: u16, rest: u16, hover: u16, press: u16) -> Op
     let mk = |s| Player::new(assets, TP, s);
     let idle = mk(rest)?;
     let rect = idle.bounds();
-    let mut b = UiButton { cmd, group: cmd, value: 0, idle: Some(idle), hover: mk(hover), click: mk(press), rect, showing: 0 };
+    let mut b = UiButton { cmd, group: cmd, value: 0, idle: Some(idle), hover: mk(hover), click: mk(press), on: None, rect, showing: 0 };
     b.show(0, false);
     Some(b)
 }
@@ -66,11 +68,14 @@ impl Panel {
         let mut arrows_off = None;
         if let Some((row_id, n)) = layout.scroller {
             row = held(assets, TP, row_id);
+            // The User Guide's screenshots show the chosen item in the red frame (18008+,
+            // cel 741) and the item under the mouse in the green one (18001+), the reverse
+            // of docs/RE_PANELS.md §1.4.
             for k in 0..n {
-                if let Some(p) = held(assets, TP, (18008 - n + k) as u16) {
+                if let Some(p) = held(assets, TP, (18015 - n + k) as u16) {
                     sel_frames.push(p);
                 }
-                if let Some(p) = held(assets, TP, (18015 - n + k) as u16) {
+                if let Some(p) = held(assets, TP, (18008 - n + k) as u16) {
                     hover_frames.push(p);
                 }
             }
@@ -82,8 +87,10 @@ impl Panel {
                 p
             });
         }
+        let n = buttons.len();
         Panel {
             bg: held(assets, TP, layout.background),
+            hidden: vec![false; n],
             buttons,
             row,
             sel_frames,
@@ -114,7 +121,15 @@ impl Panel {
     }
 
     pub fn button_at(&self, x: i32, y: i32) -> Option<usize> {
-        self.buttons.iter().position(|b| b.rect.contains(x, y))
+        (0..self.buttons.len()).find(|&i| !self.hidden.get(i).copied().unwrap_or(false) && self.buttons[i].rect.contains(x, y))
+    }
+
+    pub fn set_group_hidden(&mut self, group: u16, hidden: bool) {
+        for (i, b) in self.buttons.iter().enumerate() {
+            if b.group == group && b.cmd != CMD_UP && b.cmd != CMD_DOWN {
+                self.hidden[i] = hidden;
+            }
+        }
     }
 
     fn play_sounds(b: &mut UiButton, assets: &Assets, audio: &Audio, enabled: bool) {
@@ -162,10 +177,13 @@ impl Panel {
     /// Show selected buttons held at the end of their press script, others at rest.
     pub fn sync(&mut self, selected: &[bool]) {
         for (i, b) in self.buttons.iter_mut().enumerate() {
+            // Chosen buttons hold their "on" art (MBTN field 2/3, else the press script's end).
             let sel = selected.get(i).copied().unwrap_or(false);
-            if sel && b.showing != 2 {
-                b.show(2, false);
-            } else if !sel && b.showing == 2 && Some(i) != self.hover && b.player_ref().is_some_and(|p| p.finished) {
+            let on = if b.on.is_some() { 3 } else { 2 };
+            let pressing = b.showing == 2 && !b.player_ref().is_some_and(|p| p.finished);
+            if sel && b.showing != on && !pressing {
+                b.show(on, false);
+            } else if !sel && (b.showing == 2 || b.showing == 3) && Some(i) != self.hover && !pressing {
                 b.show(0, false);
             }
         }
@@ -194,8 +212,8 @@ impl Panel {
         if let Some(p) = &self.bg {
             p.draw(frame);
         }
-        for b in &self.buttons {
-            if (b.cmd == CMD_UP || b.cmd == CMD_DOWN) && pages <= 1 {
+        for (i, b) in self.buttons.iter().enumerate() {
+            if (b.cmd == CMD_UP || b.cmd == CMD_DOWN) && pages <= 1 || self.hidden.get(i).copied().unwrap_or(false) {
                 continue;
             }
             if let Some(p) = b.player_ref() {

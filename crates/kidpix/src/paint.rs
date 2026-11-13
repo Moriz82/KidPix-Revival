@@ -371,14 +371,6 @@ impl MediaStroke {
         }
     }
 
-    /// For spacing==0 brushes: keep spraying while the button is held still.
-    pub fn idle(&mut self, dst: &mut Image, color: u32) {
-        if self.params.spacing <= 0.0 {
-            if let Some((x, y)) = self.last {
-                self.one(dst, x, y, color);
-            }
-        }
-    }
 }
 
 /// Hard round line (pencil): stamps a disc along the segment.
@@ -406,282 +398,22 @@ pub fn line(dst: &mut Image, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, col
 // ---------------------------------------------------------------------------------------
 // Flood fill.
 
-/// Pixels connected to (x, y) whose color is within `tolerance` of the seed color.
-pub fn flood_region(img: &Image, x: i32, y: i32, tolerance: u32) -> Vec<(i32, i32)> {
-    let Some(seed) = img.get(x, y) else {
-        return Vec::new();
-    };
-    let w = img.width as i32;
-    let h = img.height as i32;
-    let close = |c: u32| {
-        let (_, r1, g1, b1) = split(c);
-        let (_, r2, g2, b2) = split(seed);
-        r1.abs_diff(r2) + g1.abs_diff(g2) + b1.abs_diff(b2) <= tolerance
-    };
-    let mut seen = vec![false; (w * h) as usize];
-    let mut stack = vec![(x, y)];
-    let mut region = Vec::new();
-    while let Some((sx, sy)) = stack.pop() {
-        if seen[(sy * w + sx) as usize] {
-            continue;
-        }
-        let mut lx = sx;
-        while lx > 0 && !seen[(sy * w + lx - 1) as usize] && close(img.pixels[(sy * w + lx - 1) as usize]) {
-            lx -= 1;
-        }
-        let mut rx = sx;
-        while rx < w - 1 && !seen[(sy * w + rx + 1) as usize] && close(img.pixels[(sy * w + rx + 1) as usize]) {
-            rx += 1;
-        }
-        for xx in lx..=rx {
-            let i = (sy * w + xx) as usize;
-            if seen[i] {
-                continue;
-            }
-            seen[i] = true;
-            region.push((xx, sy));
-            for ny in [sy - 1, sy + 1] {
-                if ny >= 0 && ny < h {
-                    let j = (ny * w + xx) as usize;
-                    if !seen[j] && close(img.pixels[j]) {
-                        stack.push((xx, ny));
-                    }
-                }
-            }
-        }
-    }
-    region
-}
 
 // ---------------------------------------------------------------------------------------
 // Pixel effects (used by effect brushes in a radius and by mixer on the whole canvas).
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Effect {
-    Invert,
-    Greyscale,
-    Sepia,
-    Posterize,
-    Solarize,
-    HueShift,
-    Blur,
-    Mosaic,
-    Emboss,
-    Edge,
-}
 
-pub fn luma(c: u32) -> u32 {
-    let (_, r, g, b) = split(c);
-    (r * 77 + g * 150 + b * 29) >> 8
-}
 
-fn hue_rotate(c: u32, deg: f32) -> u32 {
-    let (_, r, g, b) = split(c);
-    let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let v = max;
-    let d = max - min;
-    let s = if max > 0.0 { d / max } else { 0.0 };
-    let mut h = if d == 0.0 {
-        0.0
-    } else if max == r {
-        60.0 * (((g - b) / d) % 6.0)
-    } else if max == g {
-        60.0 * ((b - r) / d + 2.0)
-    } else {
-        60.0 * ((r - g) / d + 4.0)
-    };
-    h += deg;
-    gfx::hsv(h, s, v)
-}
 
-/// Apply a per-pixel effect to all pixels of `img` where `mask(x, y)` is true.
-pub fn apply_effect(img: &mut Image, effect: Effect, rect: (i32, i32, i32, i32), mask: impl Fn(i32, i32) -> bool) {
-    let (x0, y0, x1, y1) = (
-        rect.0.max(0),
-        rect.1.max(0),
-        rect.2.min(img.width as i32),
-        rect.3.min(img.height as i32),
-    );
-    if x0 >= x1 || y0 >= y1 {
-        return;
-    }
-    let src = img.clone();
-    let get = |x: i32, y: i32| {
-        src.get(x.clamp(0, src.width as i32 - 1), y.clamp(0, src.height as i32 - 1))
-            .unwrap_or(WHITE)
-    };
-    for y in y0..y1 {
-        for x in x0..x1 {
-            if !mask(x, y) {
-                continue;
-            }
-            let c = get(x, y);
-            let (_, r, g, b) = split(c);
-            let out = match effect {
-                Effect::Invert => 0xff00_0000 | (!c & 0x00ff_ffff),
-                Effect::Greyscale => {
-                    let l = luma(c);
-                    gfx::rgb(l as u8, l as u8, l as u8)
-                }
-                Effect::Sepia => {
-                    let l = luma(c) as f32;
-                    gfx::rgb(
-                        (l * 1.07 + 20.0).min(255.0) as u8,
-                        (l * 0.95 + 5.0).min(255.0) as u8,
-                        (l * 0.72).min(255.0) as u8,
-                    )
-                }
-                Effect::Posterize => {
-                    let q = |v: u32| ((v / 64) * 85).min(255) as u8;
-                    gfx::rgb(q(r), q(g), q(b))
-                }
-                Effect::Solarize => {
-                    let s = |v: u32| if v > 127 { 255 - v } else { v } as u8;
-                    gfx::rgb(s(r) * 2, s(g) * 2, s(b) * 2)
-                }
-                Effect::HueShift => hue_rotate(c, 40.0),
-                Effect::Blur => {
-                    let mut acc = [0u32; 3];
-                    for dy in -2..=2 {
-                        for dx in -2..=2 {
-                            let (_, r, g, b) = split(get(x + dx, y + dy));
-                            acc[0] += r;
-                            acc[1] += g;
-                            acc[2] += b;
-                        }
-                    }
-                    gfx::rgb((acc[0] / 25) as u8, (acc[1] / 25) as u8, (acc[2] / 25) as u8)
-                }
-                Effect::Mosaic => {
-                    let s = 10;
-                    get(x - x.rem_euclid(s) + s / 2, y - y.rem_euclid(s) + s / 2)
-                }
-                Effect::Emboss => {
-                    let a = luma(get(x - 1, y - 1)) as i32;
-                    let b2 = luma(get(x + 1, y + 1)) as i32;
-                    let v = (128 + (b2 - a) * 2).clamp(0, 255) as u8;
-                    gfx::rgb(v, v, v)
-                }
-                Effect::Edge => {
-                    let gx = luma(get(x + 1, y)) as i32 - luma(get(x - 1, y)) as i32;
-                    let gy = luma(get(x, y + 1)) as i32 - luma(get(x, y - 1)) as i32;
-                    let m = ((gx * gx + gy * gy) as f32).sqrt().min(255.0) as u8;
-                    gfx::rgb(255 - m, 255 - m, 255 - m)
-                }
-            };
-            img.put(x, y, out);
-        }
-    }
-}
 
-/// Apply an effect within a circle (effect brushes).
-pub fn effect_dab(img: &mut Image, effect: Effect, cx: f32, cy: f32, radius: f32) {
-    let r2 = radius * radius;
-    let rect = (
-        (cx - radius) as i32,
-        (cy - radius) as i32,
-        (cx + radius) as i32 + 1,
-        (cy + radius) as i32 + 1,
-    );
-    apply_effect(img, effect, rect, |x, y| {
-        let dx = x as f32 + 0.5 - cx;
-        let dy = y as f32 + 0.5 - cy;
-        dx * dx + dy * dy <= r2
-    });
-}
 
-/// Whole-picture transforms used by the Electric Mixer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mix {
-    Effect(Effect),
-    FlipH,
-    FlipV,
-    Kaleidoscope,
-    Ripple,
-    Shatter,
-    Swirl,
-}
 
-pub fn mix_canvas(img: &mut Image, mix: Mix, rng: &mut Rng) {
-    let w = img.width as i32;
-    let h = img.height as i32;
-    let src = img.clone();
-    let get = |x: i32, y: i32| src.pixels[(y.clamp(0, h - 1) * w + x.clamp(0, w - 1)) as usize];
-    match mix {
-        Mix::Effect(e) => apply_effect(img, e, (0, 0, w, h), |_, _| true),
-        Mix::FlipH => {
-            for y in 0..h {
-                for x in 0..w {
-                    img.put(x, y, get(w - 1 - x, y));
-                }
-            }
-        }
-        Mix::FlipV => {
-            for y in 0..h {
-                for x in 0..w {
-                    img.put(x, y, get(x, h - 1 - y));
-                }
-            }
-        }
-        Mix::Kaleidoscope => {
-            for y in 0..h {
-                for x in 0..w {
-                    let sx = if x < w / 2 { x } else { w - 1 - x };
-                    let sy = if y < h / 2 { y } else { h - 1 - y };
-                    img.put(x, y, get(sx, sy));
-                }
-            }
-        }
-        Mix::Ripple => {
-            for y in 0..h {
-                for x in 0..w {
-                    let ox = (y as f32 / 12.0).sin() * 8.0;
-                    let oy = (x as f32 / 15.0).sin() * 6.0;
-                    img.put(x, y, get(x + ox as i32, y + oy as i32));
-                }
-            }
-        }
-        Mix::Shatter => {
-            let tile = 30;
-            for ty in (0..h).step_by(tile) {
-                for tx in (0..w).step_by(tile) {
-                    let ox = rng.range(-6.0, 6.0) as i32;
-                    let oy = rng.range(-6.0, 6.0) as i32;
-                    for y in ty..(ty + tile as i32).min(h) {
-                        for x in tx..(tx + tile as i32).min(w) {
-                            img.put(x, y, get(x + ox, y + oy));
-                        }
-                    }
-                }
-            }
-        }
-        Mix::Swirl => {
-            let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
-            let maxr = cx.min(cy);
-            for y in 0..h {
-                for x in 0..w {
-                    let dx = x as f32 - cx;
-                    let dy = y as f32 - cy;
-                    let r = (dx * dx + dy * dy).sqrt();
-                    let a = (1.0 - (r / maxr).min(1.0)) * 2.2;
-                    let (s, c) = a.sin_cos();
-                    let sx = cx + dx * c - dy * s;
-                    let sy = cy + dx * s + dy * c;
-                    img.put(x, y, get(sx as i32, sy as i32));
-                }
-            }
-        }
-    }
-}
 
 /// Fill styles for the paint can.
 #[derive(Clone)]
 pub enum FillStyle {
     Solid,
     /// Picture stretched over the filled area (the CD's gradient fills).
-    Stretch(Image),
     /// Picture repeated (the CD's pattern fills).
     Tile(Image),
     /// Greyscale texture shaded with the current color (TP 20500+i).
@@ -690,24 +422,7 @@ pub enum FillStyle {
     Gradient(crate::fills::Grad),
 }
 
-fn sample_bilinear(img: &Image, fx: f32, fy: f32) -> u32 {
-    let w = img.width as i32;
-    let h = img.height as i32;
-    let x0 = (fx.floor() as i32).clamp(0, w - 1);
-    let y0 = (fy.floor() as i32).clamp(0, h - 1);
-    let x1 = (x0 + 1).min(w - 1);
-    let y1 = (y0 + 1).min(h - 1);
-    let tx = ((fx - x0 as f32).clamp(0.0, 1.0) * 255.0) as u32;
-    let ty = ((fy - y0 as f32).clamp(0.0, 1.0) * 255.0) as u32;
-    let p = |x: i32, y: i32| img.pixels[(y * w + x) as usize] | 0xff00_0000;
-    lerp(lerp(p(x0, y0), p(x1, y0), tx), lerp(p(x0, y1), p(x1, y1), tx), ty)
-}
 
-pub fn fill_with(img: &mut Image, x: i32, y: i32, style: &FillStyle, color: u32) -> bool {
-    let region = crate::fills::region(img, x, y);
-    paint_region(img, &region, style, color, (x as f32, y as f32));
-    !region.is_empty()
-}
 
 // ---------------------------------------------------------------------------------------
 // Shapes (Drawing Tools) and cut-outs (Scissors).
@@ -793,14 +508,5 @@ pub fn paint_region(img: &mut Image, region: &[(i32, i32)], style: &FillStyle, c
         FillStyle::Tint(t) => crate::fills::tint(img, region, t, color),
         FillStyle::Tile(pat) => crate::fills::pattern(img, region, pat),
         FillStyle::Gradient(g) => crate::fills::gradient_fill(img, region, g, focus),
-        FillStyle::Stretch(src) => {
-            let (bx0, by0, bx1, by1) = region_bbox(region);
-            let (bw, bh) = ((bx1 - bx0 + 1) as f32, (by1 - by0 + 1) as f32);
-            for &(px, py) in region {
-                let fx = (px - bx0) as f32 / bw * src.width as f32 - 0.5;
-                let fy = (py - by0) as f32 / bh * src.height as f32 - 0.5;
-                img.pixels[(py * w + px) as usize] = sample_bilinear(src, fx, fy);
-            }
-        }
     }
 }

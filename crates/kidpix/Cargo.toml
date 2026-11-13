@@ -13,6 +13,10 @@ path = "src/main.rs"
 mohawk = { path = "../mohawk" }
 kp-import = { path = "../kp-import" }
 kp-swf = { path = "../kp-swf" }
+kp-kpx = { path = "../kp-kpx" }
+kp-brushes = { path = "../kp-brushes" }
+kp-lex = { path = "../kp-lex" }
+kp-qt = { path = "../kp-qt" }
 winit = "0.30"
 softbuffer = "0.4"
 cpal = "0.15"

@@ -52,6 +52,8 @@ pub struct LibDrawer {
     pub libs: Vec<PathBuf>,
     pub lib: usize,
     archive: Option<Archive>,
+    /// Files of a user folder library ("My Sounds"), indexed by item id.
+    files: Vec<PathBuf>,
     pub items: Vec<LibItem>,
     pub page: usize,
 }
@@ -65,7 +67,7 @@ impl LibDrawer {
                 let thumb = a.get(assets::T_BMP, id).and_then(|d| mohawk::decode_bitmap(d, None).ok()).map(|t| gfx::resize(&t, 48, 36));
                 items.push(LibItem { id, title: String::new(), thumb });
             }
-            return Some(LibDrawer { kind, libs: vec![PathBuf::from(PAPER)], lib: 0, archive: Some((*a).clone()), items, page: 0 });
+            return Some(LibDrawer { kind, libs: vec![PathBuf::from(PAPER)], lib: 0, archive: Some((*a).clone()), files: Vec::new(), items, page: 0 });
         }
         let libs = assets.libraries(kind.dir());
         if libs.is_empty() {
@@ -76,6 +78,7 @@ impl LibDrawer {
             libs,
             lib: 0,
             archive: None,
+            files: Vec::new(),
             items: Vec::new(),
             page: 0,
         };
@@ -104,8 +107,31 @@ impl LibDrawer {
         self.load();
     }
 
+    /// Put a user folder (e.g. the artist's "My Sounds") first in the folder list.
+    pub fn add_user_folder(&mut self, dir: PathBuf) {
+        if dir.is_dir() && !self.libs.contains(&dir) {
+            self.libs.insert(0, dir);
+            self.lib = 0;
+            self.page = 0;
+            self.load();
+        }
+    }
+
     fn load(&mut self) {
         self.items.clear();
+        self.files.clear();
+        if let Some(dir) = self.libs.get(self.lib).filter(|p| p.is_dir()).cloned() {
+            self.archive = None;
+            let want = |p: &PathBuf| p.extension().is_some_and(|e| self.kind == LibKind::Sounds && e.eq_ignore_ascii_case("wav"));
+            let mut files: Vec<PathBuf> = std::fs::read_dir(&dir).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| want(p)).collect()).unwrap_or_default();
+            files.sort();
+            for (i, f) in files.iter().enumerate() {
+                let title = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                self.items.push(LibItem { id: i as u16, thumb: Some(name_thumb(&title)), title });
+            }
+            self.files = files;
+            return;
+        }
         self.archive = self.libs.get(self.lib).and_then(|p| match Archive::open(p) {
             Ok(a) => Some(a),
             Err(e) => {
@@ -165,6 +191,9 @@ impl LibDrawer {
     }
 
     pub fn sound(&self, id: u16) -> Option<Arc<Sound>> {
+        if let Some(f) = self.files.get(id as usize) {
+            return crate::formats::load_wav(f).ok().map(Arc::new);
+        }
         let a = self.archive.as_ref()?;
         mohawk::decode_sound(a.get(assets::T_WAV, id)?).ok().map(Arc::new)
     }
@@ -214,4 +243,31 @@ fn knock_out_white(img: &Image) -> Image {
         }
     }
     out
+}
+
+/// Thumbnail for a user item without art: its name on a white tile, in the UI font.
+fn name_thumb(name: &str) -> Image {
+    let mut img = Image::filled(48, 48, 0xffff_ffff);
+    gfx::fill_rect(&mut img, 0, 0, 48, 1, 0xff80_8080);
+    gfx::fill_rect(&mut img, 0, 47, 48, 1, 0xff80_8080);
+    gfx::fill_rect(&mut img, 0, 0, 1, 48, 0xff80_8080);
+    gfx::fill_rect(&mut img, 47, 0, 1, 48, 0xff80_8080);
+    let fonts = crate::ui::Fonts { faces: Vec::new() };
+    let words: Vec<&str> = name.split_whitespace().collect();
+    let mut lines: Vec<String> = Vec::new();
+    for w in words {
+        let cand = match lines.last() {
+            Some(l) if fonts.measure(crate::ui::UI_BITMAP, 0.0, &format!("{l} {w}")) <= 44.0 => format!("{l} {w}"),
+            _ => {
+                lines.push(String::new());
+                w.to_string()
+            }
+        };
+        *lines.last_mut().unwrap() = cand;
+    }
+    for (i, l) in lines.iter().take(3).enumerate() {
+        let w = fonts.measure(crate::ui::UI_BITMAP, 0.0, l);
+        fonts.draw(&mut img, crate::ui::UI_BITMAP, 0.0, ((48.0 - w) / 2.0).max(2.0), 16.0 + i as f32 * 12.0, 0xff00_0000, l);
+    }
+    img
 }

@@ -746,6 +746,34 @@ admits cell borders that are 0xFF in the mask.
 * 8-bit cels in TP tBMH 18000 are shadow alpha maps (§1.3).
 * The ABC tool depends on Small Kids Mode. Normal mode is the typed-text panel (no alphabet
   stamps); Small Kids Mode is the alphabet panel.
+* **Scroller frames (from the User Guide screenshots):** the chosen item shows the *red*
+  frame (scripts 18008+, cel 741), the item under the mouse the green one (18001+) — the
+  reverse of §1.4.
+* **Chosen-button look:** a selected panel button shows MBTN field 2, or field 3 when field 2
+  is 0 (RE_SHELL Appendix B) — for the pencils, erasers, buckets and brush types that is the
+  rollover script held at its end (the tilted "picked up" pose in the User Guide), not the
+  press script.
+* **Tint masks:** the 8-bit cels of TP tBMH 18000 are not shadows: they are intensity masks
+  drawn with Tint multiply in the current colour (the pencil bodies, crayon, marker, brush tip,
+  bucket paint in the User Guide screenshots are the current colour). The 8-bit tray icons
+  (fills 21500+i, realistic brushes 3500–3519) are blended over white with it.
+* **Library panels (RLibPanel / RAudioPanel), inferred from data [I]** — corrected by the
+  User Guide screenshots: the left panel is MBTN 18900 (folder field 18801 + arrows 18802/18803,
+  same art as the stamp panel), not a folder list (the exe was not traced):
+  * Easel scripts 1055–1077 (the green 7-slot tray at (305,398)–(713,500) with arrows
+    1071–1077) sit against the texture "sail" button 1052 (712,398)–(748,504): they are the
+    **paper-texture picker** (`RTexturePicker`), not the sticker/background library.
+  * The libraries use the bottom strip, like the tool panels. TP 18040/18041 (empty left and
+    right panels) fit backgrounds / stickers / animations with the 7-slot scroller 18018;
+    TP 18042 (with the knob at x≈310) + MBTN 777 fits sounds with the 6-slot scroller 18019;
+    TP 18043 (yellow meter frame) is the record mode.
+  * Layout from the EaselHelp hotspots: folder label (101,510)–(256,544), folder list
+    (101,547)–(256,600), folder arrows (258,511)–(292,599), item icons (320,518)–(704,583),
+    item name (476,587)–(613,600); sounds: icons (384,520)–(701,585).
+  * TP MBTN 777 (audio): group 1 (library mode) = 200 record panel (348,519), 208 trash
+    (316,515), 211 remove the page sound (316,552); group 2 (record mode) = 201 record
+    (362,526), 202 stop (389,526), 203 play (422,528), 207 save (474,532), 200 back to the
+    library (529,519). Script 18274 (369,556)–(443,575), 101 frames = the 10-second meter.
 
 ## 6. Unknowns / open questions
 

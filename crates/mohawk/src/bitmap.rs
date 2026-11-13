@@ -446,6 +446,13 @@ fn decode_jpeg(jpeg: &[u8]) -> Result<Image> {
 
 /// Split a `tBMH` bitmap set and decode every member (16-bit sprites).
 pub fn decode_bitmap_set(data: &[u8], palette: Option<&Palette>) -> Result<Vec<Image>> {
+    decode_bitmap_set_masks(data, palette).map(|(imgs, _)| imgs)
+}
+
+/// Like [`decode_bitmap_set`], also telling which members are 8-bit masks (no palette):
+/// their pixels are `alpha = value, rgb = 0`. The engine draws them as Tint masks in the
+/// current colour.
+pub fn decode_bitmap_set_masks(data: &[u8], palette: Option<&Palette>) -> Result<(Vec<Image>, Vec<bool>)> {
     let mut r = Reader::new(data);
     let count = r.u16()? as usize;
     r.skip(4)?;
@@ -471,6 +478,7 @@ pub fn decode_bitmap_set(data: &[u8], palette: Option<&Palette>) -> Result<Vec<I
     }
     offsets.push(data.len());
     let mut out = Vec::with_capacity(count);
+    let mut masks = Vec::with_capacity(count);
     for i in 0..count {
         let (a, b) = (offsets[i], offsets[i + 1].max(offsets[i]));
         let Some(slice) = data.get(a..b.min(data.len())) else {
@@ -478,16 +486,17 @@ pub fn decode_bitmap_set(data: &[u8], palette: Option<&Palette>) -> Result<Vec<I
         };
         let h = BitmapHeader::parse(slice)?;
         let mut img = decode_bitmap(slice, palette)?;
-        if h.bpp_code() == 2 && palette.is_none() {
-            // 8-bit members without a palette are soft drop-shadow alpha maps
-            // (0 = transparent, n = coverage n/255), drawn as black.
+        let mask = h.bpp_code() == 2 && palette.is_none();
+        if mask {
+            // 8-bit members without a palette are intensity masks (0 = transparent).
             for p in img.pixels.iter_mut() {
                 *p = (*p & 0xff) << 24;
             }
         }
         out.push(img);
+        masks.push(mask);
     }
-    Ok(out)
+    Ok((out, masks))
 }
 
 /// Mohawk LZSS decompression (header: u32 uncompressed, u32 compressed, u16 dict size).

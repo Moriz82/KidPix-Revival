@@ -524,6 +524,19 @@ the exe.
 A reader only needs the generic Mohawk parser; the order only matters for byte-identity. Load failure → `LoadFailPrompt` ("Couldn't open this Kid Pix picture. Starting new
 picture.").
 
+### 8.10 Corrections found while implementing (`crates/kp-kpx`) [data]
+Nothing above contradicted the bytes (crate rebuilds all 25 samples byte-identically). Additions:
+* **Ordering rule, generalised:** disk order = tRem catalogue order, then tRem; file index 1 =
+  tRem, then catalogue order; per-type tables ordered by each type's first file index. This
+  reproduces the fixed lists of §8.9 and is what kp-kpx uses for pages with objects
+  (default catalogue order: tBMP 1, tWAV 1, objects in z-order, tTHM 1, tBMP 2) [inf].
+* **tWAV size quirks:** outer `MHWK` size = 4 + `Data` chunk size (ignores the 20-byte `ADPC`
+  chunk); the `Data` chunk size *includes* its own 8-byte header; sample bytes = count/2.
+* **JPEG details:** 4:4:4 (no chroma subsampling), JFIF 1.01 at 72 dpi, near-lossless quant
+  tables (both: DC 2, every AC 1 ≈ quality 100), plus a `COM` segment `"AppleMark\n"` – so the shipped
+  samples were encoded with Mac QuickTime, not by the game's own writer.
+* In all samples `tBMP 2` is byte-identical to `tBMP 1` (no objects to flatten).
+
 ---
 
 ## 9. Slide Show ("Project Zone")
@@ -751,7 +764,8 @@ Invalid index (<0 or >20) → 14. Swatch hotspot *i* (cmd 1000, idx i) is the co
   (`FUN_004377c0`, completion drives mode 3). Global toggle = pref 0 (menu 211); Stop
   button / turning TTS off stops speech.
 * `usa86.lex` + `engphon.env` are **not TTS**: they are the Franklin/Proximity
-  spelling lexicon for *Check Spelling* (DIALOG 129, user words in `user.dct`).
+  spelling lexicon for *Check Spelling* (DIALOG 129, user words in `user.dct`); format in
+  FORMATS.md "Spelling lexicon".
 
 ---
 
@@ -791,7 +805,7 @@ Invalid index (<0 or >20) → 14. Swatch hotspot *i* (cmd 1000, idx i) is the co
 ## 14. Unknowns / open points
 * Exact tick unit of tSCR tempo (100 ⇒ 100 ms assumed from splash music length) and the
   meaning of script op 9.
-* RFlattenDlg button labels (art in 8005–8012 did not decode with our tools).
+* ~~RFlattenDlg button labels~~ — resolved: cmd 1600 = **SELECTED**, 1601 = **ALL** (title "What should be flattened?"); the art cels lack bit 15, which is not a hide flag.
 * tSWF `extra` low 10 bits semantics; tTXT style/justification bit values; colour byte
   order (assumed COLORREF R,G,B).
 * Transition duration and QuickTime SMPTE pattern rendering details (wpID tables).

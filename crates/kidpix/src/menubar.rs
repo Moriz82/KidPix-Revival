@@ -43,6 +43,8 @@ pub mod cmd {
     pub const HELP: u16 = 213;
     pub const ABOUT: u16 = 100;
     pub const USER_GUIDE: u16 = 237;
+    /// Kid Pix Revival addition: also write a PNG copy whenever a picture is saved.
+    pub const PNG_COPY: u16 = 900;
 }
 
 #[derive(Clone, Copy)]
@@ -62,26 +64,26 @@ pub static MENUS: &[Menu] = &[
     Menu {
         title: "File",
         items: &[
-            Cmd(cmd::NEW, "New..."),
-            Cmd(cmd::OPEN, "Open..."),
-            Cmd(cmd::SAVE_AS, "Save As...\tCtrl+S"),
+            Cmd(cmd::NEW, "&New..."),
+            Cmd(cmd::OPEN, "&Open..."),
+            Cmd(cmd::SAVE_AS, "&Save As..."),
             Sep,
-            Cmd(cmd::EXPORT, "Export..."),
+            Cmd(cmd::EXPORT, "&Export..."),
             Sep,
             Cmd(cmd::PRINT, "Print..."),
             Cmd(cmd::NEW_USER, "Log In as New User..."),
             Sep,
-            Cmd(cmd::EXIT, "Exit\tCtrl+Q"),
+            Cmd(cmd::EXIT, "E&xit"),
         ],
     },
     Menu {
         title: "Edit",
         items: &[
-            Cmd(cmd::UNDO_REDO, "Undo/Redo\tCtrl+Z"),
+            Cmd(cmd::UNDO_REDO, "Undo/Redo"),
             Sep,
-            Cmd(cmd::CUT, "Cut\tCtrl+X"),
-            Cmd(cmd::COPY, "Copy\tCtrl+C"),
-            Cmd(cmd::PASTE, "Paste\tCtrl+V"),
+            Cmd(cmd::CUT, "Cut"),
+            Cmd(cmd::COPY, "Copy"),
+            Cmd(cmd::PASTE, "Paste"),
         ],
     },
     Menu {
@@ -121,6 +123,8 @@ pub static MENUS: &[Menu] = &[
             Cmd(cmd::CLEAN_UP, "Clean Up"),
             Sep,
             Cmd(cmd::PROJECT_MODE, "Go to Project/Paint Mode"),
+            Sep,
+            Cmd(cmd::PNG_COPY, "Turn PNG Copy On/Off"),
         ],
     },
     Menu {
@@ -145,6 +149,8 @@ pub static MENUS: &[Menu] = &[
 pub fn accelerator(c: char) -> Option<u16> {
     Some(match c.to_ascii_uppercase() {
         'C' => cmd::COPY,
+        // Kid Pix Revival addition: Ctrl+E exports the picture as an image.
+        'E' => cmd::EXPORT,
         'Q' => cmd::EXIT,
         'S' => cmd::SAVE_AS,
         'V' => cmd::PASTE,
@@ -163,6 +169,18 @@ pub struct MenuState {
     pub manual_advance: bool,
     pub small_kids: bool,
     pub slideshow_mode: bool,
+    /// Also save a PNG next to each saved `.kpx` (Kid Pix Revival addition).
+    pub png_copy: bool,
+    /// The page has text boxes (enables Check Spelling).
+    pub has_text: bool,
+    /// Parental Controls: "Enable Kid Pix Email".
+    pub email_enabled: bool,
+    /// The next Undo/Redo is a redo (menu text "Redo drawing").
+    pub redo: bool,
+    /// Undo/Redo menu texts from KPD3.ini [UndoStrings].
+    pub undo_word: &'static str,
+    pub redo_word: &'static str,
+    pub undo_what: &'static str,
 }
 
 impl MenuState {
@@ -170,10 +188,16 @@ impl MenuState {
         let onoff = |on: bool, what: &str| format!("Turn {what} {}", if on { "Off" } else { "On" });
         match id {
             cmd::TOOL_SOUNDS => onoff(self.tool_sounds, "Tool Sounds"),
-            cmd::TEXT_TO_SPEECH => onoff(self.text_to_speech, "Text to Speech"),
+            cmd::TEXT_TO_SPEECH => onoff(self.text_to_speech, "Text-To-Speech"),
+            cmd::UNDO_REDO => {
+                let w = if self.redo { self.redo_word } else { self.undo_word };
+                let w = if w.is_empty() { if self.redo { "Redo" } else { "Undo" } } else { w };
+                if self.undo_what.is_empty() { w.to_string() } else { format!("{w} {}", self.undo_what) }
+            }
             cmd::ATTACHED_SOUND => onoff(self.attached_sound, "Attached Sound"),
             cmd::MANUAL_ADVANCE => onoff(self.manual_advance, "Manual Advance"),
             cmd::SMALL_KIDS => onoff(self.small_kids, "Small Kids Mode"),
+            cmd::PNG_COPY => onoff(self.png_copy, "PNG Copy"),
             cmd::PROJECT_MODE => {
                 if self.slideshow_mode {
                     "Go to Paint Zone".into()
@@ -187,11 +211,19 @@ impl MenuState {
 
     pub fn enabled(&self, id: u16) -> bool {
         match id {
-            // The Kid Pix email web service is long gone.
-            cmd::EMAIL_SETUP | cmd::EMAIL_SEND => false,
+            // E-mail: Set Up always; Send once Kid Pix Email is enabled there.
+            cmd::EMAIL_SETUP => !self.slideshow_mode,
+            cmd::EMAIL_SEND => self.email_enabled && !self.slideshow_mode,
+            // Enabled by the text tool: there must be text on the page.
+            cmd::CHECK_SPELLING => self.has_text && !self.slideshow_mode,
+            // Picker (SlideShow) only.
             cmd::LOAD_PICTURE | cmd::MANUAL_ADVANCE | cmd::CLEAN_UP | cmd::CHANGE_EFFECTS | cmd::PICK_BG_COLOR => {
                 self.slideshow_mode
             }
+            // Easel only.
+            cmd::ADD_GRAPHIC | cmd::ADD_MOVIE | cmd::IMPORT_BACKGROUND | cmd::IMPORT_SOUND | cmd::EDIT_ABC_TEXT
+            | cmd::FLATTEN_TEXT | cmd::FLATTEN_STICKERS | cmd::SAY_IT_THIS_WAY | cmd::IDEA_MACHINE
+            | cmd::TOOL_SOUNDS | cmd::ATTACHED_SOUND | cmd::SMALL_KIDS | cmd::PNG_COPY => !self.slideshow_mode,
             cmd::PRINT => !self.small_kids,
             _ => true,
         }
@@ -216,6 +248,19 @@ const GREY: u32 = 0xffc0_c0c0;
 const NAVY: u32 = 0xff00_0080;
 
 impl MenuBar {
+    /// Draw a Win32 menu label: `&x` underlines x.
+    fn draw_mnemonic(&self, frame: &mut Image, fonts: &Fonts, x: f32, y: f32, col: u32, text: &str) {
+        let plain = text.replace('&', "");
+        fonts.draw(frame, self.face, FONT, x, y, col, &plain);
+        if let Some(i) = text.find('&') {
+            let pre = &text[..i];
+            let ch: String = text[i + 1..].chars().take(1).collect();
+            let ux = x + fonts.measure(self.face, FONT, pre);
+            let uw = fonts.measure(self.face, FONT, &ch).max(1.0);
+            gfx::fill_rect(frame, ux as i32, y as i32 + 2, uw.round() as i32, 1, col);
+        }
+    }
+
     pub fn new(fonts: &Fonts, face: usize) -> MenuBar {
         let mut m = MenuBar { shown: false, open: None, hover_item: None, dragging: false, title_x: Vec::new(), face };
         m.layout(fonts, false);
@@ -255,7 +300,8 @@ impl MenuBar {
                 Cmd(id, l) => {
                     let label = st.label(*id, l);
                     let (a, b) = label.split_once('\t').unwrap_or((&label, ""));
-                    w = w.max(fonts.measure(self.face, FONT, a) as i32 + fonts.measure(self.face, FONT, b) as i32 + 60);
+                    let a = a.replace('&', "");
+                    w = w.max(fonts.measure(self.face, FONT, &a) as i32 + fonts.measure(self.face, FONT, b) as i32 + 60);
                     h += ITEM_H;
                 }
                 Sep => h += SEP_H,
@@ -398,9 +444,9 @@ impl MenuBar {
                         0xff00_0000
                     };
                     if !enabled && !hot {
-                        fonts.draw(frame, self.face, FONT, (x + 21) as f32, (yy + 14) as f32, 0xffff_ffff, a);
+                        self.draw_mnemonic(frame, fonts, (x + 21) as f32, (yy + 14) as f32, 0xffff_ffff, a);
                     }
-                    fonts.draw(frame, self.face, FONT, (x + 20) as f32, (yy + 13) as f32, col, a);
+                    self.draw_mnemonic(frame, fonts, (x + 20) as f32, (yy + 13) as f32, col, a);
                     if !b.is_empty() {
                         let bw = fonts.measure(self.face, FONT, b);
                         fonts.draw(frame, self.face, FONT, (x + w) as f32 - bw - 14.0, (yy + 13) as f32, col, b);

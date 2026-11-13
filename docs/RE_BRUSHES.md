@@ -644,20 +644,26 @@ Radius `R = trunc(panelSize)*10 - 5` (5/15/25). Each mouse move draws two rings
 (20-segment disks): radii [R−3, R−2] in colour `255 - c/2` per channel (pale tint), and
 [R−1, R] in the current colour; alpha **60/255** (Shift: 25/255), alpha blending.
 
-### 5.7 Particle **[O]/[I]** (`@0x440af0`, `@0x440dd0`, `@0x440f40`, `@0x441140`)
+### 5.7 Particle **[O]** (`@0x440980`, `@0x440af0`, `@0x440f40`, `@0x441140`, `@0x441330`)
 
-A particle system (field layout matches the well-known "Emitter" demo code). Pool of 1000
-particles. Emitter defaults: position z = 150, yaw 0 ± 2π, pitch π/2 ± pitchVar, speed
-3 ± 1, emits 10 ± 15 per update (rounded, none if < 1), life 60 ± 15 updates, force
-(0, 0, −0.1). At mouse down: pitchVar = size·π/180 (size 5/10/50 → degrees), start colour
-= `1 - current` (per channel, 0..1), end colour = current ± 0.05, emitter x,y = mouse.
-Every mouse move re-positions the emitter and emits. A periodic input-object tick
-(registered with value 8) updates every particle: `pos += dir; dir += force; life -= 1;
-colour += Δcolour`, renders live particles with OpenGL; when a particle's life reaches 0
-or its z ≤ 0 it is painted permanently as a dot in its current colour
-(`@0x441330`), and returned to the pool. `rnd()` here is `(rand() - 16383) * k` in [−1,1].
-On tool deactivation all live particles are dropped as dots. Exact dot size and the GL
-projection are **[?]**.
+An "Emitter"-style particle system, pool 1000. `rnd()` = `(rand() − 0x3fff) · 0.00006103888`
+(`@0x440930`, ≈ −1..1). Emitter (ctor `@0x440dd0`): position (400, 300, 150), yaw 0 ± 2π,
+pitch π/2 ± pitchVar, speed 3 ± 1, `10 + trunc(rnd·15)` particles per emission (none if
+≤ 0), life `60 + trunc(rnd·15)`, start colour ± 0, end colour ± 0.05, force (0, 0, −0.1).
+* Mouse down (`@0x440af0`): pitchVar = size° (sizes 5/10/50), end colour = current colour
+  (0..1), start colour = 1 − current, emitter x, y = mouse; emit. Every mouse move
+  (`@0x440c30`) moves the emitter and emits.
+* Emission (`@0x440f40`), rnd order: yaw, pitch, speed, 3 × start, 3 × end, life;
+  direction `(−sin yaw · cos pitch, cos yaw · cos pitch, sin pitch) · speed` — mostly +z,
+  a small x/y spread; Δcolour = (end − start) / life.
+* Update (input-manager idle callback, mask 8; `@0x441440`): per particle, if life ≤ 0 or
+  z ≤ 0 → paint it with `SetPixel` (one pixel at `(trunc x, trunc y)`, colour clamped to
+  0..1 ·255) and free it (`@0x441330`); else pos += dir, dir += force, life −= 1,
+  colour += Δcolour.
+* The live particles are drawn as `GL_POINTS` at their z > 0, outside the ortho/identity
+  clip volume, so nothing is visible until they land as dots.
+* Deactivation (`@0x441510`) sets every life to 0 and updates once: all are painted.
+* Update rate: one callback per idle input event **[I]** (port: 30 ms).
 
 ### 5.8 Garland (starburst) **[O]** (`@0x43e380`, `@0x43e1e0`)
 
@@ -696,15 +702,20 @@ draw a random tile of the set there (transparent mode 8) and play the fx sound.
 Drag rect (Pt2Rect from start); Icons.MHK tBMP **3605** (479×479 window art) stretched
 into the rect, transparent copy.
 
-### 5.14 Door / DoorPlain **[O]/[I]** (`@0x43c720`…`@0x43d000`)
+### 5.14 Door / DoorPlain **[O]** (`@0x43c720`…`@0x43d130`)
 
 Drag rect, minimum size 3 × the first piece's width/height (in each direction from the
-start point). Door: OpenGL quad, smooth vertical gradient top (255,255,207) → bottom
-white, 1-px black frame; window panes **3600** (15×19) tiled with 2-px gaps: columns
+start point, `@0x43c7c0`). Door: OpenGL quad, smooth vertical gradient top (255,255,207) →
+bottom white, 1-px black frame; window panes **3600** (15×19) tiled with 2-px gaps: columns
 `(w-18)/(pw+2)`, rows `(h-40)/(ph+2)`, centred horizontally, from top+10; door knob
-**3601** (7×20) at `right - knobW - 2`, vertically centred. DoorPlain uses pieces from
-**3602–3604** (panel art) and **3605**; its exact panel layout (`@0x43cdf0`, `@0x43d000`)
-is **[?]**.
+**3601** (7×20) at `right - knobW - 2`, vertically centred.
+DoorPlain (tray icon 3536, pieces **3602–3604**, 20×20 / 20×31 / 20×39):
+* background `@0x43cfc0`: `FillRect` RGB(204, 102, 51), then a black 1-px `Rectangle`
+  (NULL brush);
+* panels `@0x43d000`: `cols = (w − 12) / (pw + 8)`, `x0 = (w − cols·(pw+8) + 8) / 2`,
+  rows from `top + 10`, each row drawn while `y + ph < bottom − 20`, transparent copy at
+  `left + x0 + k·(pw+8)`, then `y += ph + 8` and the piece index steps 3602 → 3603 →
+  3604 → 3602 (`@0x43d130`).
 
 ### 5.15 Roof **[O]** (`@0x442430`, `@0x442530`)
 
@@ -784,44 +795,106 @@ branch(x,y,len,angle,spread):
 
 ## 6. Sound Art (voice) brushes
 
-### 6.1 Input pipeline **[O]/[I]** (`@0x4502e0`, `@0x450380`, `@0x464120`)
+Transcribed from KPD3.exe (IDA 9.5 / Hex-Rays plus disassembly where the decompiler lost
+track of the stack); port in `crates/kp-brushes/src/voice.rs`. Field names are the
+RVoiceBrush offsets.
 
-* `v3` creates a microphone recorder; `v5` starts recording, copies the brush colour
-  (5-bit) as base and current colour, and arms the brush.
-* Every tick: read 512 samples; an analysis routine returns `freq` = **index of the
-  strongest spectral bin** and `amp` = **its magnitude** **[I]** (it scans a magnitude array
-  for its peak). If either is 0 both scaled values are 0. Else
-  `A = amp * amplitudeBias * 0.01`, `F = freq * frequencyBias * 0.01`, and the max of
-  each is tracked. If `F <= 10` the colour stays the base colour, otherwise the hue of
-  the base colour is replaced by a value derived from `F` (`hsv2rgb(h' % 360, s, v)`;
-  the exact `h'` formula is hidden in x87 code **[?]**).
-* Movement handling is the pad engine's (spacing 0 → keeps stamping when still).
-* Spatter override (`v40`): returns `(21 - min(trunc(F)/sizeIndex, 20)) * spatter`, i.e.
-  "always draw" when spatter ≠ 0 — only relevant for the base RVoiceBrush.
-* Oscillation override (`v41`): radius bound `min(trunc(A)*sizeIndex, oscillation)`,
-  otherwise as §3.5.
-* Pad size (`v26`): `brushID` 1..127 is used directly as the size; otherwise size 5.
+### 6.1 Microphone analysis **[O]** (`@0x463e80`, `@0x463d10`, `@0x462e20`, `@0x464120`)
 
-### 6.2 Variants (`v14` per class)
+* `waveIn` 22,050 Hz, 16-bit mono, three 8 KB buffers. A worker thread feeds every buffer
+  in 512-sample chunks into a sliding **1024-point** window (oldest 512 shifted out) and
+  runs a radix-2 FFT (no window function) after each chunk.
+* Each tick the brush reads bins 0..511: `mag[k] = trunc(|X_k| / sqrt(1024) / 256)` (u16),
+  `freq` = the first strongest bin (DC included), `amp` = its magnitude.
+* Tick (`v8`, `@0x450380`), only while armed **and** the recorder runs (no microphone →
+  nothing at all): clear the bin buffer, analyse. If `freq != 0 && amp != 0`: track the
+  largest `freq`/`amp` since mouse down (0x57e / 0x57c), `A = amp · amplitudeBias · 0.01`,
+  `F = freq · frequencyBias · 0.01`; colour = base colour if `F ≤ 10`, else
+  `hsv2rgb((short)trunc(h_base + F) % 360, s_base, v_base)` (5-bit HSV, `@0x447ce0` /
+  `@0x447e10`). Otherwise `A = F = 0` and the colour is left as it is.
+  Then movement: `spacing ≠ 0` → walk from the last point when |dx| or |dy| ≥ spacing;
+  `spacing = 0` → walk when the mouse moved, else one pad call `v14(0, 0)` in place.
+* Walk (`v15`, `@0x4448c0`): the pad rect is first centred on the start point (`v16`), then
+  a Bresenham walk calls `v14(dx, dy)` every `step` pixels (spacing, 3 when 0) and once
+  for the remainder.
+* Mouse down (`@0x450670`): base pad setup (rect = point − size/2; its own `v14(0,0)` runs
+  before the brush is armed, so nothing is drawn), reset A/F/maxima, base and current
+  colour = palette colour as `(127 + 31·c) / 255`, start the recorder, arm. Mouse up stops
+  the recorder and disarms.
+* `v41` oscillation (`@0x4501a0`): `m = (short)(s · trunc(A))`, capped at `oscillation`;
+  if `m ≠ 0`: `r = rand() % m`; if `r ≠ 0`: `θ = rand() % 360` **used as radians**,
+  offset `(trunc(cos θ · r), trunc(sin θ · r))`. `s` = panel size 1–3.
+* Pad size (`v26`): `brushID` when 1..127, else per class: CVB1/2 → 5, CVB5 and
+  Touchless5 → 2, CVB7 → 3, all other voice and Touchless classes → 1; CVB10 keeps the
+  base class's Brushes.MHK pad `1001 + s − 1` (side = max(w, h)). The cfg's `brushID 1001`
+  lines therefore mean "default".
 
-Each draws GDI shapes in the current voice colour, only if armed **[O]**:
+GDI primitives: `@0x4f8854(rect, colour)` = `Ellipse` with a solid brush and the NULL pen
+(filled, one pixel smaller right/bottom); `@0x4f8996(rect)` = `Ellipse` with the NULL brush
+and the current pen (outline; pen = 1 px voice colour unless noted, width = field 0x28);
+`@0x4f8633(rect)` = `PatBlt(PATINVERT)` with brush `PALETTEINDEX(255)` clipped to
+`CreateEllipticRgn(rect)` — inverts the oval (index 255 is white in the canvas palette
+**[I]**). "grow g" = `InsetRect(r, −g, −g)`; `R` = the pad rect after the step's move.
 
-* CVB1: if `A != 0`: oval at the oscillated rect grown by
-  `min(rand() % trunc((F+100)*0.01) + 1, 4*s)`.
-* CVB2: if `A != 0`: filled oval grown by `min(rand() % trunc((A+100)*0.01) + 1, 12*s)`.
-* CVB3: if `F != 0`: filled oval grown by `min(rand() % trunc((F+10)*0.1) + 1, 12*s)`.
-* CVB4: if `A != 0 && F != 0`: rect grown by `min(1 - trunc((F+10)*k), 12*s)`
-  (unsigned compare, effectively always `12*s`) **[I]**, painted with the pattern brush.
-* CVB5–10 and Touchless1–10: individual shape rules (ovals, lines, multiple stamps per
-  tick scaled by the max frequency) not fully transcribed **[?]** — see `v14` at
-  0x449550, 0x449760, 0x449980, 0x449cb0, 0x449ea0, 0x448cf0 and 0x44e910…0x44fd80.
+### 6.2 CustomVoiceBrush1–10 `v14` **[O]**
 
-### 6.3 Hands-free (Touchless) **[I]**
+| # | addr | rule |
+|---|------|------|
+| 1 | 0x448a80 | if A: R − osc, grow `min(rand % trunc((F+100)·0.01) + 1, 4s)`, **filled** oval |
+| 2 | 0x448f30 | if A: R − osc, grow `min(rand % trunc((A+100)·0.01) + 1, 12s)`, outline |
+| 3 | 0x449140 | if F: R − osc, grow `min(rand % trunc((F+10)·0.1) + 1, 12s)`, outline |
+| 4 | 0x449350 | if A and F: R − osc, grow `min(1 + trunc((F+10)·0.1), 12s)`, **invert** oval |
+| 5 | 0x449550 | for every bin 0..=max freq: R, plus `osc·s` if the bin is non-zero; filled oval each |
+| 6 | 0x449760 | osc; `InsetRect(R, −(trunc(A)&0xffff) % ox, … % oy)` (0 when the offset is 0), `+ osc·s`, outline |
+| 7 | 0x449980 | for every bin 0..=max freq: zero bin → outline at R with the current pen; else R + osc, colour = base hue + magnitude (kept as brush colour, becomes the pen), grow `(mag/100 + 1)·s`, outline |
+| 8 | 0x449cb0 | grow trunc(A), + osc, pen width `min(rand % trunc((F+10)·0.1) + 1, 2s)`, outline (draws even when silent) |
+| 9 | 0x449ea0 | grow `−trunc(A / (−6 / s))`, + osc, invert oval then outline |
+| 10 | 0x448cf0 | the pad rect is **not** moved; `q = rect.topLeft + (dx, dy) + osc`; line from the previous `q` (first: the click point) to `q` |
 
-The brush position moves by itself (no mouse): velocity driven by amplitude/frequency
-and gravity (`gravityBias`, `gravityTime`, `gravityRange`, `dampBias`), with `wrap`
-(cfg `wrap=0` for all Touchless sections → edges clamp/bounce, `wrap=1` would wrap around
-the canvas, `@0x44b670`). Details **[?]**.
+### 6.3 Hands-free (Touchless1–10, RHandsFreeBrush) **[O]**
+
+* Starts when the brush is **selected** (`v3` `@0x44ae90`): centre of the canvas, recorder
+  on, A/F/maxima/velocity cleared, colour from the palette, armed. Mouse clicks do nothing
+  (`v5` is a null routine), except Touchless10 whose `v5` re-arms at the click point and
+  restarts its line there. Updates come from an input-idle callback (`@0x44b170`) that
+  first turns the stored update time into "ms since".
+* Update (`@0x44b1f0`): analyse; proceed if there is sound **or** the time since the last
+  update exceeds `gravityTime` (after one skipped update the stored value is an elapsed
+  time, so the next one always proceeds); otherwise A = F = 0 and stop. Proceeding: as
+  §6.1 but the colour threshold is `F ≤ 1`; then
+  * push = `(trunc(cos α · |A|), trunc(sin α · |A|))`, `α = (u16)trunc(F) % 360` as radians;
+  * if `gravityBias ≠ 0`: gravity = `accelerationBias · 0.1 · gravityBias · 0.001 · d²`
+    towards the start centre (d = distance; 0 within `gravityRange`), kept until the next
+    computation;
+  * velocity += push + gravity, each axis clamped to ±50, then damped by
+    `dampBias · 0.01` towards 0 (unchanged when smaller); position += velocity;
+  * walk from the current point to the truncated position.
+* Pad step (`v46` `@0x44b670`, called first by every Touchless `v14`): move rect and point
+  by the step, then keep the rect in the canvas: `wrap` → wrap around, else pin to the
+  edge (velocity not reversed); position = point. Touchless1–9 then move the rect by the
+  step **again** (so the shapes run ahead of the point until the next walk re-centres it);
+  Touchless10 does not.
+* Defaults (`@0x44a9d0`): accelerationBias 1, gravityBias 1, gravityTime 100,
+  gravityRange 1, dampBias 2, wrap 0. The cfg's `acceleratonBias` (sic) is never read, so
+  every Touchless brush has accelerationBias 1.
+* Every 10 moves the colour getter `v29` (`@0x44abe0`) steps the hue by 2 at full
+  saturation/value; it is not used for drawing.
+
+| # | addr | rule (R = pad rect after both moves) |
+|---|------|------|
+| 1 | 0x44e910 | as CVB1 |
+| 2 | 0x44eb80 | if A: R − osc, grow `min(rand % trunc((A+100)·0.01) + 1, 4s)`, outline |
+| 3 | 0x44edc0 | if F: grow trunc(A), + osc, pen width `min(rand % trunc((F+10)·0.1) + 1, 2s)`, outline |
+| 4 | 0x44eff0 | if A and F: R − osc, `InsetRect(−ox·s, −oy·s)`, invert oval |
+| 5 | 0x44f1f0 | as CVB5 |
+| 6 | 0x44f440 | as CVB6 |
+| 7 | 0x44f690 | as CVB7 but only bins with magnitude > 10 are scattered/recoloured |
+| 8 | 0x44f9d0 | grow trunc(A), + osc·s, outline |
+| 9 | 0x44fba0 | grow trunc(A·0.1), + osc·s, invert oval then outline |
+| 10 | 0x44fd80 | as CVB10 (line from 0x638), rect moved only by `v46` |
+
+Remaining **[I]**: the idle-callback rate (the port runs one update per frame) and the
+colour of `PALETTEINDEX(255)` (taken as white → inversion).
 
 ---
 
@@ -829,8 +902,9 @@ the canvas, `@0x44b670`). Details **[?]**.
 
 * **Shapes** (RRollerSubPanel "Cyclic", RCyclic) **[O]**: list = Cyclic.MHK tBMP 24000,
   24100, … while present (15 sets; the tBMP is the icon, tBMH with the same id is the
-  sprite set, REGS id/id+1 its registration points). While held, every **100 ms** (also
-  when still) the brush stamps a random cel `rnd(1, count-1)` of the set at the mouse
+  sprite set, REGS id/id+1 its registration points). While held (`@0x442cc0`), whenever
+  the stamp time has passed — at once after mouse down, which clears it — the brush
+  stamps and sets the next time to now + **100 ms**; it stamps a random cel `rnd(1, count-1)` of the set at the mouse
   point minus the cel's registration offset, transparent copy. Size table {0,1,2}; the
   RSimpleBitmap base scales ×1/×2/×4 by size, RCyclic's own stamp does not scale **[O]**.
 * **Moving paint** (RSpraySubPanel "RSprayPanel", RSprayGun) **[O]/[I]**: Anims.MHK sets
@@ -838,8 +912,9 @@ the canvas, `@0x44b670`). Details **[?]**.
   each fire (if the mouse is inside the canvas) starts a random script
   `rnd(first, first+count-1)` of the selected set at the mouse point, confined to the
   canvas. When a script ends its last frame is composited into the picture. On tool
-  switch all running sprites of the set are finished. Timer period and script→sound
-  binding **[?]**.
+  switch all running sprites of the set are finished. The RTimer is started at mouse
+  down with **50 ms**, repeating, and the mouse down sends the first shot itself
+  (`@0x443ce0`). Script→sound binding **[?]**.
 
 ---
 
@@ -858,15 +933,63 @@ canvas cursor index. Use the FORMATS.md list (5/15 paint brush, 6 airbrush,
 2. Colorize formula overflow (§3.9) — verify visually in the original.
 3. Tinting of the 8-bit realistic-brush icons 3500–3519 (§1.3).
 4. Exact pixel mapping of drip cels (§3.8) and Anims/Cyclic compositing.
-5. Voice brush hue-from-frequency formula, CVB5–10 and all Touchless shapes,
-   hands-free motion model (§6).
-6. Particle dot size / projection (§5.7), Rainbow orientation (§5.18), DoorPlain panel
-   layout (§5.14).
+5. ~~Voice brush hue formula, CVB5–10, Touchless shapes, hands-free motion~~ — done (§6).
+6. Rainbow orientation (§5.18). (Particle and DoorPlain: done, §5.7 / §5.14.)
 7. INI reader case sensitivity (`densitybias`, `GreyScaleBrushSnd`) and duplicate
    section precedence.
-8. Idle-tick rate that drives `spacing = 0` brushes, Particle updates and the spray timer.
+8. Idle-tick rate that drives `spacing = 0` brushes, Particle and hands-free updates
+   (the spray timer is 50 ms, §7).
 9. FeltPenSnds.MHK usage; TP.MHK 20400–20448 / 20500–20541 are not used by brush code
    (no references found).
 
 Fastest way to settle 2–8: run the original under Wine/Xvfb at 16-bit colour and compare
 strokes pixel by pixel with the port.
+
+---
+
+## Corrections found while implementing (`crates/kp-brushes`)
+
+Settled from the decompiled code / CD data while writing the Rust port:
+
+1. **INI reader** (`@0x4f0543`, section match `@0x4f1324`, key match `@0x4f13c1`):
+   section *and* key names are compared with `_memicmp` → **case-insensitive**; the
+   **first** section of a name wins; `;` lines are comments; a section ends at the next
+   `[` line; the value is trimmed and one pair of matching quotes is stripped; numbers go
+   through `strtol(value, &end, 0)` (base 0: `0x` hex, leading `0` octal) and must lie in
+   −32768..32767, otherwise the field keeps its default. Consequences: the lower-case
+   `densitybias` lines of CustomBrush7/11/16 **are** read (§3.8 [?] resolved),
+   `[GreyScaleBrushSnd]` **does** match `GreyscaleBrush` (§2.4), and for the duplicate
+   `[BlurBrushSnd]` the first copy wins (moot: BlurBrush reads `[RealBrushSnd]`).
+2. **Texture term** in the blend (§3.6): the code adds `254.0` (`v24`), not 255:
+   `t = (a + tv / textureBias) / (254 + D)`. `tv = 255 - texel` with Space is computed as
+   `(u8)(-1 - texel)`.
+3. **Blend packing** (§3.6): channels are stored in bytes (`(u8)(__int64)value`, so
+   negatives wrap) and packed as `b | (g | r<<5) << 5` with OR and no masking; the smear
+   path clamps "`> 31` as unsigned byte" (negatives become 31).
+4. **Spacing test** (§3.3): a move is walked when `|dx| >= step` **or** `|dy| >= step`
+   (`step` = cfg spacing, or 3 when spacing is 0).
+5. **rnd(lo, hi)** (`@0x459760`): `n = hi-lo+1; limit = 0x8000 - 0x8000 % n;` reroll while
+   `rand() > limit` (strictly greater, so `limit` itself is accepted and maps to `lo`);
+   result `lo + r % n`.
+6. **Voice brush defaults** (ctor `@0x44ffd0`): `frequencyBias` and `amplitudeBias`
+   default to **1**; the voice ctor seeds `srand(timeGetTime())`. The hands-free keys
+   are `accelerationBias gravityBias gravityTime gravityRange dampBias wrap`
+   (`PTR_DAT_0058188c` = `"wrap"`, confirmed from the string table).
+7. **Spiral sounds** (§2.4 table says "no section → silent"): the name table has
+   `Spiral` twice (tool 22 and transition 129) and the lookup is by name, so the Wacky
+   Spiral finds the transition section `[SpiralSnd] startSoundID = 7224` and plays it at
+   mouse down (unless RSpiral overrides `v21`, not re-checked).
+8. **Drip cels** (§3.8): tBMH 3200 holds 8-bit *alpha* cels (black, alpha 0xa0–0xff
+   edges) for cels 1–8/17–24/… and opaque magenta 16-bit cels of the same shapes for
+   9–16/25–32/…; each frame lists `[magenta, mask]` at the same registration. The port
+   tints by coverage = cel alpha (so effectively solid current colour) — still [I].
+9. **Script placement** (drips, moving spray): scripts carry authoring-time bounds
+   (e.g. drip 3200 at (393,299)); the port anchors the first frame's first cel position
+   (`bounds.topLeft + (x, y)`, i.e. its registration point) on the mouse point and keeps
+   all later cels relative to it [I]. Frame period = tempo (100) ms [I].
+10. **DoorPlain**, **Particle**, all Sound Art classes, the hands-free motion and the
+    spray timer were re-traced in IDA 9.5 (database kept outside the repo) and are now
+    transcribed (§5.7, §5.14, §6, §7). Corrections over the first port: CVB1 fills and
+    CVB2 outlines (swapped before), CVB4/9 and Touchless4/9 invert, Touchless shapes
+    differ from the CVB ones, no stamp at mouse down, colour unchanged on silence,
+    Particle flies in z and lands as 1-px dots, spray period 50 ms.

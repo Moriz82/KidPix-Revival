@@ -45,6 +45,8 @@ pub fn is_game_root(dir: &Path) -> bool {
 /// A set of sprite cels (from a `tBMH`) plus their registration points.
 pub struct SpriteSet {
     pub cels: Vec<Image>,
+    /// Cels that are 8-bit Tint masks (drawn in the current colour).
+    pub masks: Vec<bool>,
     pub reg_x: Vec<i16>,
     pub reg_y: Vec<i16>,
 }
@@ -54,12 +56,11 @@ impl SpriteSet {
     pub fn cel(&self, n: u16) -> Option<&Image> {
         self.cels.get((n as usize).checked_sub(1)?)
     }
-    pub fn reg(&self, n: u16) -> (i32, i32) {
+    /// Registration point of cel n, if the REGS tables have one (the extra tBMP cel of a
+    /// tCNT set has none: it is placed at the script's top-left).
+    pub fn reg_of(&self, n: u16) -> Option<(i32, i32)> {
         let i = n as usize;
-        (
-            self.reg_x.get(i).copied().unwrap_or(0) as i32,
-            self.reg_y.get(i).copied().unwrap_or(0) as i32,
-        )
+        Some((*self.reg_x.get(i)? as i32, *self.reg_y.get(i)? as i32))
     }
 }
 
@@ -175,16 +176,28 @@ impl Assets {
             return Some(s.clone());
         }
         let a = self.archive(rel)?;
-        let cels = match mohawk::decode_bitmap_set(a.get(T_BMH, id)?, None) {
+        let (mut cels, mut masks) = match mohawk::decode_bitmap_set_masks(a.get(T_BMH, id)?, None) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("warning: {rel} tBMH {id}: {e}");
                 return None;
             }
         };
+        // tCNT {base, count}: count = set cels + 1; the last cel is the standalone tBMP `base`
+        // (e.g. the splash still, the easel backdrop).
+        if let Some(cnt) = a.get(mohawk::Tag(*b"tCNT"), id).filter(|c| c.len() >= 4) {
+            let base = u16::from_be_bytes([cnt[0], cnt[1]]);
+            let count = u16::from_be_bytes([cnt[2], cnt[3]]) as usize;
+            if count > cels.len() {
+                if let Some(img) = a.get(T_BMP, base).and_then(|d| mohawk::decode_bitmap(d, None).ok()) {
+                    cels.push(img);
+                    masks.push(false);
+                }
+            }
+        }
         let reg_x = a.get(REGS, id).map(mohawk::parse_regs).unwrap_or_default();
         let reg_y = a.get(REGS, id + 1).map(mohawk::parse_regs).unwrap_or_default();
-        let s = Rc::new(SpriteSet { cels, reg_x, reg_y });
+        let s = Rc::new(SpriteSet { cels, masks, reg_x, reg_y });
         self.sprites.borrow_mut().insert(key, s.clone());
         Some(s)
     }
@@ -274,6 +287,46 @@ impl Assets {
             })
             .unwrap_or_default();
         v.sort();
+        v.extend(system_text_fonts());
         v
     }
+}
+
+/// A few installed system families the original's font list (EnumFontFamilies) would also
+/// show, Arial being its default: the common Windows / macOS fonts or their metric-compatible
+/// Linux equivalents. Only these files are loaded, so start-up stays quick.
+fn system_text_fonts() -> Vec<PathBuf> {
+    let names = [
+        "arial.ttf", "Arial.ttf", "LiberationSans-Regular.ttf",
+        "times.ttf", "Times New Roman.ttf", "LiberationSerif-Regular.ttf",
+        "cour.ttf", "Courier New.ttf", "LiberationMono-Regular.ttf",
+        "comic.ttf", "Comic Sans MS.ttf",
+        "verdana.ttf", "Verdana.ttf",
+    ];
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if cfg!(windows) {
+        dirs.push(PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into())).join("Fonts"));
+    } else if cfg!(target_os = "macos") {
+        dirs.extend(["/System/Library/Fonts/Supplemental", "/Library/Fonts", "/System/Library/Fonts"].map(PathBuf::from));
+    } else {
+        for d in ["/usr/share/fonts", "/usr/local/share/fonts"] {
+            let base = PathBuf::from(d);
+            dirs.push(base.clone());
+            if let Ok(rd) = std::fs::read_dir(&base) {
+                for e in rd.flatten().filter(|e| e.path().is_dir()) {
+                    dirs.push(e.path());
+                    if let Ok(rd2) = std::fs::read_dir(e.path()) {
+                        dirs.extend(rd2.flatten().map(|x| x.path()).filter(|p| p.is_dir()));
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for n in names {
+        if let Some(p) = dirs.iter().map(|d| d.join(n)).find(|p| p.is_file()) {
+            out.push(p);
+        }
+    }
+    out
 }

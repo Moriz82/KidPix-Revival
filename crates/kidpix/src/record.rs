@@ -63,11 +63,25 @@ impl Recorder {
         self.buf.lock().unwrap().len() >= self.max_samples
     }
 
-    /// Peak level of the last 50 ms (0..1), for a level meter.
-    pub fn level(&self) -> f32 {
+
+    /// Sample rate of the input device.
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    /// The last `n` samples (mono).
+    pub fn tail(&self, n: usize) -> Vec<i16> {
         let v = self.buf.lock().unwrap();
-        let n = (self.rate / 20) as usize;
-        v.iter().rev().take(n).map(|s| (*s as f32).abs() / 32768.0).fold(0.0, f32::max)
+        v[v.len().saturating_sub(n)..].to_vec()
+    }
+
+    /// Drop all but the last `keep` samples (live-input use such as Sound Art).
+    pub fn trim(&self, keep: usize) {
+        let mut v = self.buf.lock().unwrap();
+        let n = v.len();
+        if n > keep * 2 {
+            v.drain(..n - keep);
+        }
     }
 
     pub fn finish(self) -> Sound {

@@ -1,0 +1,9 @@
+[package]
+name = "kp-qt"
+description = "QuickTime movie reader for the Kid Pix Deluxe 3 CD: MOV demuxer, Sorenson Video 1 (tables read from the user's QuickTimeAuthoring.qtx) and IMA4 audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

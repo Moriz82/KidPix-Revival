@@ -2,6 +2,18 @@
 
 use crate::gfx::{self, argb, blend, split, Image};
 
+/// Face index of the built-in Win9x-style bitmap UI font (`uifont.rs`); size is ignored.
+pub const UI_BITMAP: usize = usize::MAX;
+
+fn bitmap_glyph(c: char) -> Option<&'static (char, u8, [u16; 11])> {
+    let i = (c as u32).checked_sub(32)? as usize;
+    crate::uifont::GLYPHS.get(i).filter(|g| g.0 == c).or_else(|| crate::uifont::GLYPHS.iter().find(|g| g.0 == c))
+}
+
+fn bitmap_advance(c: char) -> f32 {
+    bitmap_glyph(c).or_else(|| bitmap_glyph('?')).map(|g| g.1 as f32 + 1.0).unwrap_or(4.0)
+}
+
 pub struct Fonts {
     pub faces: Vec<(String, fontdue::Font)>,
 }
@@ -11,47 +23,24 @@ impl Fonts {
         let mut faces = Vec::new();
         for f in files {
             let Ok(bytes) = std::fs::read(f) else { continue };
+            let family = crate::textbox::ttf_family(&bytes);
             if let Ok(font) = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
-                let name = f
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().trim_end_matches('_').to_string())
-                    .unwrap_or_default();
+                let name = family.unwrap_or_else(|| {
+                    f.file_stem().map(|s| s.to_string_lossy().trim_end_matches('_').to_string()).unwrap_or_default()
+                });
                 faces.push((name, font));
             }
         }
+        // Listed by family name, like the original's font enumeration.
+        faces.sort_by_key(|f: &(String, fontdue::Font)| f.0.to_lowercase());
         Fonts { faces }
     }
 
-    /// Add the operating system's UI font (for menus/dialogs, like the original's Win32 menus).
-    pub fn add_system_font(&mut self) -> Option<usize> {
-        let mut cands: Vec<std::path::PathBuf> = Vec::new();
-        if cfg!(target_os = "windows") {
-            let w = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
-            for f in ["tahoma.ttf", "arial.ttf", "segoeui.ttf"] {
-                cands.push(std::path::Path::new(&w).join("Fonts").join(f));
-            }
-        } else if cfg!(target_os = "macos") {
-            for f in ["/System/Library/Fonts/Supplemental/Tahoma.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial.ttf", "/System/Library/Fonts/Geneva.ttf"] {
-                cands.push(f.into());
-            }
-        } else {
-            for d in ["/usr/share/fonts", "/usr/local/share/fonts", "/usr/share/fonts/truetype"] {
-                for name in ["DejaVuSans.ttf", "LiberationSans-Regular.ttf", "NotoSans-Regular.ttf", "Arial.ttf"] {
-                    if let Some(p) = find_file(std::path::Path::new(d), name, 3) {
-                        cands.push(p);
-                    }
-                }
-            }
-        }
-        for p in cands {
-            if let Ok(bytes) = std::fs::read(&p) {
-                if let Ok(font) = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
-                    self.faces.push(("System".into(), font));
-                    return Some(self.faces.len() - 1);
-                }
-            }
-        }
-        None
+
+    /// Face whose family name starts with `name` (case-insensitive).
+    pub fn find(&self, name: &str) -> Option<usize> {
+        let n = name.to_lowercase();
+        self.faces.iter().position(|(f, _)| f.to_lowercase().starts_with(&n))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -60,8 +49,8 @@ impl Fonts {
 
     /// Index of a readable default UI face.
     pub fn ui_face(&self) -> usize {
-        for pref in ["STORYBOO", "PATRICK", "MARKET", "TELETYPE"] {
-            if let Some(i) = self.faces.iter().position(|(n, _)| n.eq_ignore_ascii_case(pref)) {
+        for pref in ["Storybook", "Patrick", "Market", "Teletype"] {
+            if let Some(i) = self.find(pref) {
                 return i;
             }
         }
@@ -70,6 +59,10 @@ impl Fonts {
 
     /// Width in pixels of `text` at `size`.
     pub fn measure(&self, face: usize, size: f32, text: &str) -> f32 {
+        if face == UI_BITMAP {
+            let _ = size;
+            return text.chars().map(bitmap_advance).sum::<f32>() - if text.is_empty() { 0.0 } else { 1.0 };
+        }
         let Some((_, font)) = self.faces.get(face) else {
             return 0.0;
         };
@@ -78,6 +71,26 @@ impl Fonts {
 
     /// Draw text with its baseline at `y`. Returns the advance.
     pub fn draw(&self, dst: &mut Image, face: usize, size: f32, x: f32, y: f32, color: u32, text: &str) -> f32 {
+        if face == UI_BITMAP {
+            let top = y.round() as i32 - crate::uifont::BASELINE;
+            let mut pen = x.round() as i32;
+            for c in text.chars() {
+                let Some(&(_, w, rows)) = bitmap_glyph(c).or_else(|| bitmap_glyph('?')) else { continue };
+                for (ry, bits) in rows.iter().enumerate() {
+                    for rx in 0..w as i32 {
+                        if bits >> (w as i32 - 1 - rx) & 1 == 1 {
+                            let (px, py) = (pen + rx, top + ry as i32);
+                            if px >= 0 && py >= 0 && px < dst.width as i32 && py < dst.height as i32 {
+                                dst.put(px, py, color);
+                            }
+                        }
+                    }
+                }
+                pen += w as i32 + 1;
+            }
+            let _ = size;
+            return pen as f32 - x;
+        }
         let Some((_, font)) = self.faces.get(face) else {
             return 0.0;
         };
@@ -117,12 +130,6 @@ impl Fonts {
     }
 }
 
-/// Panel look used for engine-made overlays (pickers, prompts).
-pub fn panel(dst: &mut Image, x: i32, y: i32, w: i32, h: i32) {
-    gfx::fill_round_rect(dst, x + 4, y + 5, w, h, 16, argb(90, 0, 0, 40));
-    gfx::fill_round_rect(dst, x, y, w, h, 16, gfx::rgb(40, 50, 170));
-    gfx::fill_round_rect(dst, x + 4, y + 4, w - 8, h - 8, 13, gfx::rgb(246, 246, 255));
-}
 
 /// A round button with an arrow (dir: -1 left/up, 1 right/down), horizontal or vertical.
 pub fn arrow_button(dst: &mut Image, x: i32, y: i32, size: i32, dir: i32, vertical: bool, enabled: bool) {
@@ -145,71 +152,9 @@ pub fn arrow_button(dst: &mut Image, x: i32, y: i32, size: i32, dir: i32, vertic
     }
 }
 
-/// Close (x) button.
-pub fn close_button(dst: &mut Image, x: i32, y: i32, size: i32) {
-    gfx::fill_circle(dst, x as f32 + size as f32 / 2.0, y as f32 + size as f32 / 2.0, size as f32 / 2.0, gfx::rgb(220, 60, 60));
-    let c = gfx::rgb(255, 255, 255);
-    let m = size / 4;
-    for i in m..size - m {
-        for t in -1..=1 {
-            dst.put(x + i, y + i + t, c);
-            dst.put(x + size - 1 - i, y + i + t, c);
-        }
-    }
-}
 
 pub fn hit(x: i32, y: i32, rx: i32, ry: i32, rw: i32, rh: i32) -> bool {
     x >= rx && y >= ry && x < rx + rw && y < ry + rh
 }
 
-/// The engine's own color palette (an original layout: hue columns x value rows + greys).
-pub fn palette_colors() -> Vec<u32> {
-    let mut v = Vec::new();
-    // 6 rows x 12 hues
-    for row in 0..6 {
-        for col in 0..12 {
-            let h = col as f32 * 30.0;
-            let (s, val) = match row {
-                0 => (0.35, 1.0),
-                1 => (0.6, 1.0),
-                2 => (1.0, 1.0),
-                3 => (1.0, 0.8),
-                4 => (1.0, 0.6),
-                _ => (1.0, 0.4),
-            };
-            v.push(gfx::hsv(h, s, val));
-        }
-    }
-    // greys + browns + skin tones
-    for i in 0..8 {
-        let g = (i * 255 / 7) as u8;
-        v.push(gfx::rgb(g, g, g));
-    }
-    for c in [
-        (120, 72, 40),
-        (160, 100, 60),
-        (205, 150, 100),
-        (240, 200, 160),
-    ] {
-        v.push(gfx::rgb(c.0, c.1, c.2));
-    }
-    v
-}
 
-fn find_file(dir: &std::path::Path, name: &str, depth: u32) -> Option<std::path::PathBuf> {
-    let p = dir.join(name);
-    if p.is_file() {
-        return Some(p);
-    }
-    if depth == 0 {
-        return None;
-    }
-    for e in std::fs::read_dir(dir).ok()?.flatten() {
-        if e.path().is_dir() {
-            if let Some(f) = find_file(&e.path(), name, depth - 1) {
-                return Some(f);
-            }
-        }
-    }
-    None
-}

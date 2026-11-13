@@ -238,3 +238,26 @@ mod tests {
         assert_eq!((s.sample_rate, s.samples.clone()), (11025, vec![100, -7]));
     }
 }
+
+/// Write 16-bit PCM WAV.
+pub fn save_wav(path: &Path, s: &mohawk::Sound) -> Result<(), String> {
+    let data_len = (s.samples.len() * 2) as u32;
+    let ch = s.channels.max(1) as u32;
+    let mut out = Vec::with_capacity(44 + data_len as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&(ch as u16).to_le_bytes());
+    out.extend_from_slice(&s.sample_rate.to_le_bytes());
+    out.extend_from_slice(&(s.sample_rate * ch * 2).to_le_bytes());
+    out.extend_from_slice(&((ch * 2) as u16).to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for v in &s.samples {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(path, out).map_err(|e| e.to_string())
+}
