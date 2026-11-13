@@ -35,31 +35,75 @@ need_game() {
 }
 
 # ---------------------------------------------------------------- macOS .app + .dmg
+# Prefer rustup's toolchain: a Homebrew `rust` install shadows it on PATH but only ships the
+# host's standard library, so cross-arch targets added with `rustup target add` go unused.
+use_rustup_toolchain() {
+  command -v rustup >/dev/null 2>&1 || return 0
+  local rustup_cargo
+  rustup_cargo="$(rustup which cargo 2>/dev/null)" || return 0
+  export PATH="$(dirname "$rustup_cargo"):$PATH"
+}
+
+# true if rustc has the standard library for target $1
+have_target() {
+  [ -d "$(rustc --print sysroot)/lib/rustlib/$1/lib" ]
+}
+
 package_macos() {
-  local app="dist/Kid Pix Revival.app"
+  use_rustup_toolchain
   rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null 2>&1 || true
-  cargo build --release -p kidpix --target aarch64-apple-darwin
-  cargo build --release -p kidpix --target x86_64-apple-darwin
-  rm -rf "$app"
+  local targets=() t
+  for t in aarch64-apple-darwin x86_64-apple-darwin; do
+    if have_target "$t"; then
+      targets+=("$t")
+    else
+      echo "warning: no Rust std for $t (install rustup and run: rustup target add $t); skipping it" >&2
+    fi
+  done
+  if [ ${#targets[@]} -eq 0 ]; then
+    echo "no macOS Rust targets available" >&2
+    exit 1
+  fi
+  # cargo strips release binaries with rustup's rust-objcopy, which can fail to load its
+  # libLLVM; strip the final binary with Xcode's strip instead
+  export CARGO_PROFILE_RELEASE_STRIP=none
+  local bins=()
+  for t in "${targets[@]}"; do
+    cargo build --release -p kidpix --target "$t"
+    bins+=("target/$t/release/kidpix-revival")
+  done
+  echo "built for: ${targets[*]}"
+
+  # Assemble and sign outside the repo: iCloud-synced folders (e.g. ~/Documents) tag files
+  # with Finder xattrs, and codesign refuses a bundle that has them.
+  local stage; stage="$(mktemp -d)"
+  local name="Kid Pix Revival.app"
+  local app="$stage/$name"
   mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-  lipo -create -output "$app/Contents/MacOS/kidpix-revival" \
-    target/aarch64-apple-darwin/release/kidpix-revival \
-    target/x86_64-apple-darwin/release/kidpix-revival
+  lipo -create -output "$app/Contents/MacOS/kidpix-revival" "${bins[@]}"
+  strip -S "$app/Contents/MacOS/kidpix-revival"
   sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
   printf 'APPL????' > "$app/Contents/PkgInfo"
   cp packaging/icons/kidpix-revival.icns "$app/Contents/Resources/"
   if [ "$with_game" = 1 ]; then need_game; cp -R game "$app/Contents/Resources/game"; fi
+  xattr -cr "$app"
   # ad-hoc signature (Apple Silicon refuses unsigned code); a Developer ID can replace "-"
   codesign --force --deep --sign "${MACOS_SIGN_IDENTITY:--}" --options runtime \
     --entitlements packaging/macos/entitlements.plist "$app"
+  codesign --verify --deep --strict "$app"
+
   local dmg="dist/KidPixRevival-macOS.dmg"
+  local dmgsrc="$stage/dmg"
+  mkdir -p "$dmgsrc"
+  ditto "$app" "$dmgsrc/$name"
+  ln -s /Applications "$dmgsrc/Applications"
   rm -f "$dmg"
-  local stage; stage="$(mktemp -d)"
-  cp -R "$app" "$stage/"
-  ln -s /Applications "$stage/Applications"
-  hdiutil create -volname "Kid Pix Revival" -srcfolder "$stage" -ov -format UDZO "$dmg" >/dev/null
+  hdiutil create -volname "Kid Pix Revival" -srcfolder "$dmgsrc" -ov -format UDZO "$dmg" >/dev/null
+
+  rm -rf "dist/$name"
+  ditto --norsrc --noextattr "$app" "dist/$name"
   rm -rf "$stage"
-  echo "packed $app and $dmg"
+  echo "packed dist/$name and $dmg"
 }
 
 # ---------------------------------------------------------------- Windows .exe
