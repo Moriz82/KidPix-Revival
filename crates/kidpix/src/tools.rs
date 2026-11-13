@@ -3,6 +3,7 @@
 use crate::assets::Assets;
 use crate::gfx::{self, Image};
 use crate::paint::{self, Effect, FillStyle, MediaParams, MediaStroke, Mix, Pad, Rng, BLACK, WHITE};
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ToolKind {
@@ -63,13 +64,23 @@ pub enum EraserKind {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FillKind {
-    Solid,
-    /// TP.MHK tBMP 21300..: stretched over the area.
+    /// Solid / single-colour texture i: TP tBMP 20500+i tinted with the current colour
+    /// (icon 21500+i; i = 0 is plain solid).
+    Tint(u16),
+    /// Gradient i: entry i of TP `grad` 21300 (icon 21300+i).
     Gradient(u16),
-    /// TP.MHK tBMP 21400..: tiled.
+    /// Multi-colour pattern i: TP tBMP 20400+i tiled (icon 21400+i).
     Pattern(u16),
-    /// TP.MHK tBMP 21500..: greyscale texture shaded with the color.
-    Texture(u16),
+}
+
+impl FillKind {
+    pub fn icon_id(self) -> u16 {
+        match self {
+            FillKind::Tint(i) => 21500 + i,
+            FillKind::Gradient(i) => 21300 + i,
+            FillKind::Pattern(i) => 21400 + i,
+        }
+    }
 }
 
 pub const TP: &str = "Data/Tools/TP.MHK";
@@ -179,20 +190,7 @@ pub fn options(tool: ToolKind, assets: &Assets, font_count: usize) -> Vec<Opt> {
             }
             v
         }
-        ToolKind::Fill => {
-            let mut v = vec![Opt::Fill(FillKind::Solid, "Fill")];
-            if let Some(a) = assets.archive(TP) {
-                for id in a.ids(crate::assets::T_BMP) {
-                    match id {
-                        21300..=21399 => v.push(Opt::Fill(FillKind::Gradient(id), "Fade fill")),
-                        21400..=21499 => v.push(Opt::Fill(FillKind::Pattern(id), "Pattern fill")),
-                        21500..=21599 if id != 21500 => v.push(Opt::Fill(FillKind::Texture(id), "Texture fill")),
-                        _ => {}
-                    }
-                }
-            }
-            v
-        }
+        ToolKind::Fill => vec![Opt::Fill(FillKind::Tint(0), "Fill")],
         ToolKind::Mixer => vec![
             Opt::Mix(Mix::Effect(Effect::Invert), "Invert"),
             Opt::Mix(Mix::Kaleidoscope, "Kaleidoscope"),
@@ -266,14 +264,40 @@ impl PadBank {
     }
 }
 
+/// How a Drawing Tool lays down a path.
+#[derive(Clone)]
+pub enum Pen {
+    Pencil(f32),
+    Media(MediaParams, Pad, Option<Rc<Image>>),
+}
+
 /// In-progress stroke state.
 pub enum Stroke {
     None,
     Pencil { last: (f32, f32), width: f32 },
     Media(MediaStroke),
     Wacky { kind: Wacky, last: (f32, f32), dist: f32, rng: Rng, hue: f32, cel: usize, media: Option<MediaStroke> },
-    Eraser { last: (f32, f32), size: i32 },
-    MoverSelect { start: (i32, i32), cur: (i32, i32), copy: bool },
+    /// Line / rectangle / oval rubber band (base = picture before the shape).
+    ShapeDrag { shape: crate::trays::Shape, start: (f32, f32), cur: (f32, f32), filled: bool, pen: Pen, base: Image },
+    /// Curve: after the first drag the line follows the mouse to bend; a click finishes.
+    CurveBend { a: (f32, f32), b: (f32, f32), ctrl: (f32, f32), pen: Pen, base: Image },
+    /// Polygon: click for each corner, click the first one to close.
+    Polygon { pts: Vec<(f32, f32)>, cur: (f32, f32), filled: bool, pen: Pen, base: Image },
+    Eraser { last: (f32, f32), size: i32, round: bool },
+    /// Mini mixer: mix where the mouse drags.
+    MiniMix { effect: crate::paint::Effect, radius: f32, last: (f32, f32) },
+    /// Blend fill: holding the button moves the gradient's focus.
+    Blend { region: Vec<(i32, i32)>, grad: crate::fills::Grad },
+    /// Spray can (3D shapes or moving paint).
+    Spray { set: Rc<crate::assets::SpriteSet>, moving: bool, rng: Rng, pos: (f32, f32), acc: f32, cel: usize, radius: f32 },
+    /// Sound Art with the mouse.
+    SoundArt { last: (f32, f32), hue: f32 },
+    /// Scissors: dragging out a free shape, circle or square.
+    Cut { shape: crate::trays::CutShape, pts: Vec<(f32, f32)>, start: (f32, f32), cur: (f32, f32) },
+    /// Scissors polygon: click for each corner.
+    CutPolygon { pts: Vec<(f32, f32)>, cur: (f32, f32) },
+    /// Paste jar: the next click places the clipboard.
+    PasteAim,
 }
 
 pub fn media_params(assets: &Assets, section: &str) -> MediaParams {
@@ -524,19 +548,11 @@ pub fn option_icon(opt: &Opt, assets: &Assets, bank: &PadBank, fonts: &crate::ui
             }
             img = im;
         }
-        Opt::Fill(kind, _) => match kind {
-            FillKind::Gradient(id) | FillKind::Pattern(id) | FillKind::Texture(id) => {
-                if let Some(i) = assets.image(TP, *id) {
-                    img = gfx::resize(&i, size, size);
-                }
+        Opt::Fill(kind, _) => {
+            if let Some(i) = assets.image(TP, kind.icon_id()) {
+                img = (*i).clone();
             }
-            FillKind::Solid => {
-                let mut im = Image::filled(size, size, WHITE);
-                gfx::stroke_rect(&mut im, 4, 4, size as i32 - 8, size as i32 - 8, 2, BLACK);
-                paint::fill_with(&mut im, size as i32 / 2, size as i32 / 2, &paint::FillStyle::Solid, color);
-                img = im;
-            }
-        },
+        }
         Opt::Letter(id) => {
             if let Some(i) = assets.image(TP, *id) {
                 img = gfx::resize(&i, size, size);
@@ -634,12 +650,14 @@ pub fn option_icon(opt: &Opt, assets: &Assets, bank: &PadBank, fonts: &crate::ui
 }
 
 pub fn fill_style(kind: FillKind, assets: &Assets) -> FillStyle {
-    let icon = |id: u16| assets.image(TP, id).map(|i| (*i).clone());
     match kind {
-        FillKind::Solid => FillStyle::Solid,
-        FillKind::Gradient(id) => icon(id).map(FillStyle::Stretch).unwrap_or(FillStyle::Solid),
-        FillKind::Pattern(id) => icon(id).map(FillStyle::Tile).unwrap_or(FillStyle::Solid),
-        FillKind::Texture(id) => icon(id).map(FillStyle::Tint).unwrap_or(FillStyle::Solid),
+        FillKind::Tint(i) => assets
+            .archive(TP)
+            .and_then(|a| a.get(crate::assets::T_BMP, 20500 + i).and_then(|d| mohawk::decode_indexed(d).ok()))
+            .map(FillStyle::Tint)
+            .unwrap_or(FillStyle::Solid),
+        FillKind::Pattern(i) => assets.image(TP, 20400 + i).map(|im| FillStyle::Tile((*im).clone())).unwrap_or(FillStyle::Solid),
+        FillKind::Gradient(i) => crate::fills::gradient(assets, i as usize).map(FillStyle::Gradient).unwrap_or(FillStyle::Solid),
     }
 }
 

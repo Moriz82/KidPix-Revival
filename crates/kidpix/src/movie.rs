@@ -1,0 +1,140 @@
+//! QuickTime movies (Sorenson Video 1 + IMA4 on the CD). Decoded with an `ffmpeg`
+//! executable when one is available (the codec tables can't be bundled); frames are kept
+//! as RGB555 to stay small.
+
+use crate::gfx::Image;
+use mohawk::Sound;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+
+pub struct Movie {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f32,
+    frames: Vec<Vec<u16>>,
+    pub audio: Option<Sound>,
+}
+
+impl Movie {
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn frame(&self, i: usize) -> Image {
+        let f = &self.frames[i.min(self.frames.len().saturating_sub(1))];
+        Image {
+            width: self.width,
+            height: self.height,
+            pixels: f.iter().map(|&p| mohawk::rgb555_to_argb(p)).collect(),
+        }
+    }
+
+    pub fn duration(&self) -> f32 {
+        self.frames.len() as f32 / self.fps.max(1.0)
+    }
+}
+
+pub fn ffmpeg() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    // Next to the program first (portable installs), then PATH.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            let p = d.join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).map(|d| d.join(name)).find(|p| p.is_file())
+    })
+}
+
+fn probe_size(ff: &Path, path: &Path) -> Option<(u32, u32, f32)> {
+    // ffmpeg -i prints stream info on stderr; parse "WxH" and "fps".
+    let out = Command::new(ff).arg("-hide_banner").arg("-i").arg(path).stderr(Stdio::piped()).stdout(Stdio::null()).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stderr);
+    let line = text.lines().find(|l| l.contains("Video:"))?;
+    let mut size = None;
+    for tok in line.split([' ', ',']) {
+        if let Some((w, h)) = tok.split_once('x') {
+            if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.trim_end_matches(|c: char| !c.is_ascii_digit()).parse::<u32>()) {
+                if w > 0 && h > 0 && w < 4096 {
+                    size = Some((w, h));
+                    break;
+                }
+            }
+        }
+    }
+    let fps = line
+        .split(',')
+        .find_map(|p| p.trim().strip_suffix(" fps").and_then(|v| v.trim().parse::<f32>().ok()))
+        .unwrap_or(15.0);
+    size.map(|(w, h)| (w, h, fps))
+}
+
+/// Decode a movie fully (blocking). Use [`load_async`] from the UI.
+pub fn load(path: &Path) -> Result<Movie, String> {
+    let ff = ffmpeg().ok_or("Movies need ffmpeg (https://ffmpeg.org) installed or next to Kid Pix Revival.")?;
+    let (w, h, fps) = probe_size(&ff, path).ok_or("couldn't read the movie")?;
+    let mut child = Command::new(&ff)
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb555be", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut raw = Vec::new();
+    child.stdout.take().unwrap().read_to_end(&mut raw).map_err(|e| e.to_string())?;
+    let _ = child.wait();
+    let fsize = (w * h * 2) as usize;
+    let frames: Vec<Vec<u16>> = raw
+        .chunks_exact(fsize)
+        .map(|c| c.chunks_exact(2).map(|p| u16::from_be_bytes([p[0], p[1]])).collect())
+        .collect();
+    if frames.is_empty() {
+        return Err("the movie has no pictures".into());
+    }
+    let audio = Command::new(&ff)
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-vn", "-f", "s16le", "-ac", "1", "-ar", "22050", "-"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success() && !o.stdout.is_empty())
+        .map(|o| Sound {
+            sample_rate: 22050,
+            channels: 1,
+            samples: o.stdout.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect(),
+            loop_count: 0,
+        });
+    Ok(Movie { width: w, height: h, fps, frames, audio })
+}
+
+/// Decode on a worker thread; poll the receiver from the UI loop.
+pub fn load_async(path: PathBuf) -> mpsc::Receiver<Result<Movie, String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(load(&path));
+    });
+    rx
+}
+
+#[cfg(test)]
+mod tests {
+    /// KIDPIX_MOVIE=<.mov> cargo test -p kidpix movie -- --ignored
+    #[test]
+    #[ignore]
+    fn decode_real_movie() {
+        let Ok(p) = std::env::var("KIDPIX_MOVIE") else { return };
+        let m = super::load(p.as_ref()).unwrap();
+        assert!(m.frame_count() > 10);
+        assert_eq!((m.width, m.height), (320, 240));
+        let f = m.frame(m.frame_count() / 2);
+        assert!(f.pixels.iter().any(|&p| p & 0xffffff != 0));
+    }
+}

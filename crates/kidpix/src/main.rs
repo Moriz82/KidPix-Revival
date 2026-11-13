@@ -4,16 +4,30 @@
 mod anim;
 mod assets;
 mod audio;
+mod buttons;
+mod colorpicker;
 mod easel;
 mod gfx;
 mod importer;
+mod fills;
+mod formats;
 mod library;
+mod menubar;
+mod mixer;
+mod movie;
+mod objects;
 mod paint;
+mod panels;
+mod print;
+mod record;
+mod regions;
 mod selftest;
 mod setup;
 mod slideshow;
+mod speech;
 mod stickers;
 mod tools;
+mod trays;
 mod ui;
 
 use assets::Assets;
@@ -53,6 +67,7 @@ struct Running {
     cursor: Option<(CursorHint, u32)>,
     mouse: (i32, i32),
     cursors: std::collections::HashMap<(u16, u32), winit::window::CustomCursor>,
+    movie_rx: Option<std::sync::mpsc::Receiver<Result<movie::Movie, String>>>,
 }
 
 struct App {
@@ -98,6 +113,7 @@ impl ApplicationHandler for App {
             cursor: None,
             mouse: (0, 0),
             cursors: Default::default(),
+            movie_rx: None,
         });
     }
 
@@ -140,16 +156,12 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let ctrl = r.modifiers.control_key() || r.modifiers.super_key();
                 match &event.logical_key {
-                    Key::Character(s) if ctrl => match s.to_lowercase().as_str() {
-                        "z" if r.modifiers.shift_key() => r.easel.redo(),
-                        "z" => r.easel.undo(),
-                        "y" => r.easel.redo(),
-                        "s" => r.easel.actions.push(Action::Save),
-                        "o" => r.easel.actions.push(Action::Open),
-                        "n" => r.easel.actions.push(Action::New),
-                        "q" => r.easel.actions.push(Action::Quit),
-                        _ => {}
-                    },
+                    Key::Character(s) if ctrl => {
+                        // The original accelerator table (Ctrl+C/Q/S/V/X/Z).
+                        if let Some(id) = s.chars().next().and_then(menubar::accelerator) {
+                            r.easel.menu_command(id);
+                        }
+                    }
                     Key::Named(NamedKey::Escape) => r.easel.key_escape(),
                     Key::Named(NamedKey::Delete) => r.easel.delete_under_mouse(),
                     Key::Named(NamedKey::Backspace) => r.easel.key_char('\u{8}'),
@@ -173,6 +185,15 @@ impl ApplicationHandler for App {
                     s.left_ms -= dt;
                     if s.left_ms <= 0.0 {
                         r.splash = None;
+                    }
+                }
+                if let Some(rx) = &r.movie_rx {
+                    if let Ok(res) = rx.try_recv() {
+                        r.movie_rx = None;
+                        match res {
+                            Ok(m) => r.easel.add_movie(m),
+                            Err(e) => r.easel.message(e),
+                        }
                     }
                 }
                 r.easel.update(dt);
@@ -259,6 +280,89 @@ impl App {
                         r.save_path = None;
                     }
                 }
+                Action::Export => {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .set_title("Export your picture")
+                        .add_filter("JPEG picture", &["jpg"])
+                        .add_filter("BMP picture", &["bmp"])
+                        .add_filter("PNG picture", &["png"])
+                        .set_file_name("My Picture.jpg")
+                        .save_file()
+                    {
+                        let img = r.easel.flattened();
+                        match formats::export(&img, &p) {
+                            Ok(()) => r.easel.message("Exported your picture."),
+                            Err(e) => r.easel.message(format!("Couldn't export: {e}")),
+                        }
+                    }
+                }
+                Action::AddGraphic | Action::ImportBackground => {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .set_title(if a == Action::AddGraphic { "Add Graphic" } else { "Import Background" })
+                        .add_filter("Pictures", &["bmp", "gif", "jpg", "jpeg", "png", "BMP", "GIF", "JPG", "JPEG", "PNG"])
+                        .pick_file()
+                    {
+                        match formats::load_image(&p) {
+                            Ok(img) => r.easel.import_picture(
+                                img,
+                                if a == Action::AddGraphic { easel::FitTarget::Graphic } else { easel::FitTarget::Background },
+                            ),
+                            Err(e) => r.easel.message(e),
+                        }
+                    }
+                }
+                Action::ImportSound => {
+                    if let Some(p) = rfd::FileDialog::new().set_title("Import Sound").add_filter("WAV sound", &["wav", "WAV"]).pick_file() {
+                        match formats::load_wav(&p) {
+                            Ok(s) => r.easel.set_page_sound(std::sync::Arc::new(s)),
+                            Err(e) => r.easel.message(e),
+                        }
+                    }
+                }
+                Action::IdeaMachine => {
+                    if !confirm_discard(&r.easel) {
+                        continue;
+                    }
+                    let mut dlg = rfd::FileDialog::new().set_title("Idea Machine").add_filter("Kid Pix picture", &["kpx", "KPX"]);
+                    if let Some(p) = self.assets.path("Idea Machine") {
+                        dlg = dlg.set_directory(p);
+                    }
+                    if let Some(p) = dlg.pick_file() {
+                        match load_picture(&p) {
+                            Some(img) => r.easel.load_picture(img),
+                            None => r.easel.message("Couldn't open that picture."),
+                        }
+                    }
+                }
+                Action::UserGuide => match self.assets.path("KpInstall/KdpxManual.pdf") {
+                    Some(p) => {
+                        let opener = if cfg!(target_os = "macos") { "open" } else if cfg!(windows) { "explorer" } else { "xdg-open" };
+                        let _ = std::process::Command::new(opener).arg(p).spawn();
+                    }
+                    None => r.easel.message("The User Guide wasn't found in your Kid Pix files."),
+                },
+                Action::Login | Action::EditAbcText | Action::CheckSpelling | Action::SayItThisWay | Action::StampEditor => {
+                    r.easel.dialog_action(a.clone());
+                }
+                Action::AddMovie => {
+                    let mut dlg = rfd::FileDialog::new()
+                        .set_title("Add a movie")
+                        .add_filter("QuickTime movie", &["mov", "MOV"]);
+                    if let Some(p) = self.assets.path("QTmovies") {
+                        dlg = dlg.set_directory(p);
+                    }
+                    if let Some(p) = dlg.pick_file() {
+                        r.easel.message("Getting the movie ready...");
+                        r.movie_rx = Some(movie::load_async(p));
+                    }
+                }
+                Action::Print => {
+                    let img = r.easel.flattened();
+                    match print::print(&img) {
+                        Ok(_) => r.easel.message("Sent your picture to the printer."),
+                        Err(e) => r.easel.message(format!("Couldn't print: {e}")),
+                    }
+                }
                 Action::SlideAddFile => {
                     let mut dlg = rfd::FileDialog::new()
                         .set_title("Add a picture to the slide show")
@@ -308,8 +412,17 @@ impl Running {
             return;
         }
         self.cursor = Some((hint, scale));
-        let CursorHint::Cur(n) = hint;
+        let (n, drop) = match hint {
+            CursorHint::Cur(n) => (n, false),
+            CursorHint::Drop => (u16::MAX, true),
+        };
         let key = (n, scale);
+        if drop && !self.cursors.contains_key(&key) {
+            let img = gfx::resize_nearest(&menubar::drop_cursor(), scale);
+            if let Ok(src) = winit::window::CustomCursor::from_rgba(img.to_rgba8(), img.width as u16, img.height as u16, 7 * scale as u16, 0) {
+                self.cursors.insert(key, el.create_custom_cursor(src));
+            }
+        }
         if let std::collections::hash_map::Entry::Vacant(e) = self.cursors.entry(key) {
             if let Some(c) = assets.cursor(10000 + n) {
                 let img = gfx::resize_nearest(&c.image, scale);

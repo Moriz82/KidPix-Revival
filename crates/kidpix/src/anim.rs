@@ -95,6 +95,18 @@ impl Player {
         sounds
     }
 
+    /// Cels of the current frame with their screen positions: (cel, x, y).
+    pub fn placed(&self) -> Vec<(u16, i32, i32)> {
+        self.cels
+            .iter()
+            .filter(|c| c.visible)
+            .map(|c| {
+                let (rx, ry) = self.sprites.reg(c.cel);
+                (c.cel, self.script.bounds.left as i32 + c.x as i32 - rx, self.script.bounds.top as i32 + c.y as i32 - ry)
+            })
+            .collect()
+    }
+
     pub fn draw(&self, dst: &mut Image) {
         draw_cels(dst, &self.sprites, self.script.bounds, &self.cels, None);
     }

@@ -12,7 +12,7 @@ mod sound;
 
 pub use archive::{Archive, Entry, Tag};
 pub use bitmap::{
-    decode_bitmap, decode_bitmap_set, decode_indexed, rgb555_to_argb, unpack_lz, BitmapHeader,
+    decode_bitmap, decode_bitmap_set, decode_indexed, rgb555_to_argb, unpack_lz, unpack_lz_with_header, BitmapHeader,
     Image, Indexed, Palette,
 };
 pub use button::{parse_buttons, Button};

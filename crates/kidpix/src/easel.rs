@@ -2,20 +2,25 @@
 //! the engine's own painting tools.
 
 use crate::anim::Player;
+use crate::buttons::UiButton;
 use crate::assets::{self, Assets, SpriteSet};
 use crate::audio::{self, Audio};
 use crate::gfx::{self, Image};
 use crate::library::{LibDrawer, LibKind};
 use crate::slideshow::{SlideAction, SlideShow};
 use crate::paint::{self, Canvas, MediaStroke, Rng, CANVAS_H, CANVAS_W, CANVAS_X, CANVAS_Y, WHITE};
-use crate::tools::{self, EraserKind, FillKind, Opt, PadBank, Stroke, ToolKind, Wacky};
+use crate::tools::{self, EraserKind, FillKind, PadBank, Pen, Stroke, ToolKind, Wacky};
+use crate::trays::{self, Bucket, CutShape, DrawTool, GrabAction, GrabTool, Item, PaintTool, Shape, Tray, G};
 use crate::ui::{self, Fonts};
-use mohawk::{Rect, Sound};
+use mohawk::Sound;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
 pub const EASEL: &str = "Data/Easel.MHK";
+/// The New Picture button (star paper in the right-hand oval, scripts 1046-1048) has no
+/// MBTN entry in the CD's table; the engine adds it with this private command id.
+const NEW_PICTURE_CMD: u16 = 0xfff0;
 
 /// Requests from the easel to the application shell.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,69 +31,23 @@ pub enum Action {
     New,
     Quit,
     SlideAddFile,
+    Print,
+    AddMovie,
+    Export,
+    Login,
+    AddGraphic,
+    ImportBackground,
+    ImportSound,
+    EditAbcText,
+    CheckSpelling,
+    SayItThisWay,
+    IdeaMachine,
+    UserGuide,
+    StampEditor,
 }
 
-struct UiButton {
-    cmd: u16,
-    idle: Option<Player>,
-    hover: Option<Player>,
-    click: Option<Player>,
-    rect: Rect,
-    /// Displayed script: 0 = rest (MBTN field 0), 1 = rollover (field 1), 2 = press (field 10).
-    showing: u8,
-}
-
-impl UiButton {
-    fn player(&mut self) -> Option<&mut Player> {
-        match self.showing {
-            0 => self.idle.as_mut(),
-            1 => self.hover.as_mut().or(self.idle.as_mut()),
-            _ => self.click.as_mut().or(self.idle.as_mut()),
-        }
-    }
-    fn player_ref(&self) -> Option<&Player> {
-        match self.showing {
-            0 => self.idle.as_ref(),
-            1 => self.hover.as_ref().or(self.idle.as_ref()),
-            _ => self.click.as_ref().or(self.idle.as_ref()),
-        }
-    }
-    fn show(&mut self, which: u8, play: bool) {
-        self.showing = which;
-        if let Some(p) = self.player() {
-            if play {
-                p.restart();
-            } else {
-                p.finish_now();
-            }
-        }
-    }
-}
-
-pub struct PageObj {
-    pub frames: Vec<Image>,
-    pub fps: f32,
-    pub x: i32,
-    pub y: i32,
-    pub t: f32,
-    /// Flash source (stickers/animations) so resizing re-renders sharply.
-    pub source: Option<Rc<[u8]>>,
-    pub zoom: f32,
-}
-
-impl PageObj {
-    fn frame(&self, playing: bool) -> &Image {
-        if playing && self.frames.len() > 1 {
-            let i = (self.t * self.fps.max(1.0)) as usize % self.frames.len();
-            &self.frames[i]
-        } else {
-            &self.frames[0]
-        }
-    }
-    fn size(&self) -> (i32, i32) {
-        (self.frames[0].width as i32, self.frames[0].height as i32)
-    }
-}
+pub use crate::objects::PageObj;
+use crate::objects::Handle;
 
 struct TextEntry {
     x: i32,
@@ -108,8 +67,22 @@ struct Transition {
 enum Overlay {
     None,
     Palette,
-    Menu(usize),
+    /// Picture-placement options for Add Graphic / Import Background.
+    Fit(FitTarget, Image, usize),
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FitTarget {
+    Graphic,
+    Background,
+}
+
+pub const FIT_CHOICES: [&str; 4] = [
+    "Shrink/Stretch to Fit Canvas",
+    "Fill Canvas Without Shrinking/Scaling",
+    "Center at Original Size",
+    "Repeat Many Times",
+];
 
 pub struct Easel {
     assets: Rc<Assets>,
@@ -127,11 +100,18 @@ pub struct Easel {
     drawer_frame: Option<Player>,
     slot_frames: Option<Player>,
     tool: ToolKind,
-    opt_sel: HashMap<ToolKind, usize>,
-    options: Vec<Opt>,
-    option_icons: Vec<Image>,
-    option_icons_small: Vec<Image>,
-    opt_page: usize,
+    trays: HashMap<ToolKind, Tray>,
+    panel: Option<crate::panels::Panel>,
+    shutter: Option<crate::panels::Shutter>,
+    /// Space is held (selects the mixers' alternate effects).
+    pub space: bool,
+    big_erase: Option<BigErase>,
+    tray_icons: Vec<Vec<Image>>,
+    stamp_folder: usize,
+    stamp_archive: Option<mohawk::Archive>,
+    sprays: Vec<SprayAnim>,
+    sound_art: Option<crate::record::Recorder>,
+    wander: (f32, f32, f32, f32),
     pub color: u32,
     stroke: Stroke,
     mouse: (i32, i32),
@@ -141,6 +121,10 @@ pub struct Easel {
     pub objects: Vec<PageObj>,
     drag_obj: Option<(usize, i32, i32)>,
     armed: Option<(Vec<Image>, f32, Option<Rc<[u8]>>)>,
+    armed_movie: Option<Rc<crate::movie::Movie>>,
+    scale_drag: Option<(usize, Handle, f32, i32, i32)>,
+    handles: Option<Rc<SpriteSet>>,
+    movie_time: f32,
     playing: bool,
     page_sound: Option<Arc<Sound>>,
     text: Option<TextEntry>,
@@ -157,6 +141,16 @@ pub struct Easel {
     message: Option<(String, f32)>,
     dynamite_clear: bool,
     slideshow: Option<SlideShow>,
+    menubar: crate::menubar::MenuBar,
+    picker: crate::colorpicker::ColorPicker,
+    /// The page's paper texture (Paper Texture button, cmd 238).
+    paper: Option<Rc<Image>>,
+    dropper_preview: Option<u32>,
+    menu_press: bool,
+    pub menu_state: crate::menubar::MenuState,
+    selected: Option<usize>,
+    clipboard: Option<PageObj>,
+    about: Option<Player>,
 }
 
 // Engine-drawn regions, placed inside panels painted in the original background art.
@@ -172,23 +166,12 @@ const PAL_X: i32 = 6;
 const PAL_Y: i32 = 318;
 const PAL_COLS: usize = 12;
 const PAL_CELL: i32 = 22;
-const MENU_TITLES: [&str; 4] = ["File", "Edit", "Add", "Help"];
-const MENU_X: [i32; 4] = [8, 52, 96, 136];
 const SLOT_X0: i32 = 330;
 const SLOT_Y0: i32 = 435;
 const SLOT_W: i32 = 51;
 const SLOT_COUNT: usize = 7;
 const FACE_RECT: (i32, i32, i32, i32) = (0, 238, 77, 53);
 const COLOR_RECT: (i32, i32, i32, i32) = (0, 491, 85, 109);
-
-fn menu_items(i: usize) -> &'static [&'static str] {
-    match i {
-        0 => &["New picture", "Open...", "Save", "Save as...", "Quit"],
-        1 => &["Undo", "Redo", "Clear picture"],
-        2 => &["Background", "Sticker", "Animation", "Sound", "Stamp"],
-        _ => &["About Kid Pix Revival"],
-    }
-}
 
 fn command_name(cmd: u16) -> &'static str {
     match cmd {
@@ -205,42 +188,31 @@ fn command_name(cmd: u16) -> &'static str {
         227 => "Moving Van",
         228 => "Eraser",
         239 => "Help",
-        242 => "Print (saves a picture file)",
+        242 => "Print",
         243 => "Play",
         244 => "Stop",
         270 => "Slide Show",
         281 => "Save",
         266 => "Dynamite: erase everything",
-        267 => "New picture",
+        267 => "Exit",
         _ => "",
     }
 }
 
 impl Easel {
     pub fn new(assets: Rc<Assets>, audio: Rc<Audio>) -> Easel {
-        let fonts = Fonts::load(&assets.font_files());
+        let mut fonts = Fonts::load(&assets.font_files());
+        let menu_face = fonts.add_system_font().unwrap_or_else(|| fonts.ui_face());
+        let menubar = crate::menubar::MenuBar::new(&fonts, menu_face);
         let bg = assets.image(EASEL, 1000);
-        let mut buttons = Vec::new();
-        if let Some(list) = assets
-            .archive(EASEL)
-            .and_then(|a| a.get(assets::MBTN, 75).map(mohawk::parse_buttons))
-            .and_then(|r| r.ok())
+        let mut buttons = crate::buttons::load(&assets, EASEL, 75);
         {
-            for b in list {
-                let mk = |s: u16| if s == 0 { None } else { Player::new(&assets, EASEL, s) };
-                let idle = mk(b.idle);
-                let rect = idle.as_ref().map(|p| p.bounds()).unwrap_or_default();
-                let mut ub = UiButton {
-                    cmd: b.command,
-                    idle,
-                    hover: mk(b.hover),
-                    click: mk(b.click),
-                    rect,
-                    showing: 0,
-                };
-                ub.show(0, false);
-                buttons.push(ub);
-            }
+            let mk = |s: u16| Player::new(&assets, EASEL, s);
+            let idle = mk(1046);
+            let rect = idle.as_ref().map(|p| p.bounds()).unwrap_or_default();
+            let mut b = UiButton { cmd: NEW_PICTURE_CMD, group: 0, value: 0, idle, hover: mk(1047), click: mk(1048), rect, showing: 0 };
+            b.show(0, false);
+            buttons.push(b);
         }
         let held = |id: u16| {
             Player::new(&assets, EASEL, id).map(|mut p| {
@@ -268,11 +240,17 @@ impl Easel {
             drawer_frame,
             slot_frames,
             tool: ToolKind::Pencil,
-            opt_sel: HashMap::new(),
-            options: Vec::new(),
-            option_icons: Vec::new(),
-            option_icons_small: Vec::new(),
-            opt_page: 0,
+            trays: HashMap::new(),
+            panel: None,
+            shutter: None,
+            space: false,
+            big_erase: None,
+            tray_icons: Vec::new(),
+            stamp_folder: 0,
+            stamp_archive: None,
+            sprays: Vec::new(),
+            sound_art: None,
+            wander: (300.0, 226.0, 1.5, 0.7),
             color: gfx::rgb(0, 0, 0),
             stroke: Stroke::None,
             mouse: (0, 0),
@@ -282,6 +260,10 @@ impl Easel {
             objects: Vec::new(),
             drag_obj: None,
             armed: None,
+            armed_movie: None,
+            scale_drag: None,
+            handles: assets.sprites("Data/Buttons.MHK", 7000),
+            movie_time: 0.0,
             playing: false,
             page_sound: None,
             text: None,
@@ -298,6 +280,15 @@ impl Easel {
             message: None,
             dynamite_clear: false,
             slideshow: None,
+            menubar,
+            picker: crate::colorpicker::ColorPicker::new(),
+            paper: None,
+            dropper_preview: None,
+            menu_press: false,
+            menu_state: crate::menubar::MenuState { tool_sounds: true, text_to_speech: true, attached_sound: true, ..Default::default() },
+            selected: None,
+            clipboard: None,
+            about: None,
             assets,
             audio,
         };
@@ -306,11 +297,18 @@ impl Easel {
         e
     }
 
+    pub fn assets_root(&self) -> std::path::PathBuf {
+        self.assets.root.clone()
+    }
+
     pub fn message(&mut self, s: impl Into<String>) {
         self.message = Some((s.into(), 3500.0));
     }
 
     fn play_wav(&self, archive: &str, id: u16, ch: u8) {
+        if !self.menu_state.tool_sounds && (ch == audio::CH_UI || ch == audio::CH_TOOL) {
+            return;
+        }
         if let Some(s) = self.assets.sound(archive, id) {
             self.audio.play(s, ch, false);
         }
@@ -322,27 +320,26 @@ impl Easel {
         }
     }
 
-    // ------------------------------------------------------------------ tools & options
+    // ------------------------------------------------------------------ tools & trays
 
     fn select_tool(&mut self, tool: ToolKind, from_click: bool) {
         self.commit_text();
         self.stroke = Stroke::None;
+        let changed = tool != self.tool || self.panel.is_none();
         self.tool = tool;
-        self.options = tools::options(tool, &self.assets, self.fonts.faces.len());
-        self.option_icons = self
-            .options
-            .iter()
-            .map(|o| tools::option_icon(o, &self.assets, &self.pads, &self.fonts, OPT_ICON))
-            .collect();
-        self.option_icons_small = self.option_icons.iter().map(|i| gfx::resize(i, 32, 32)).collect();
-        let sel = *self.opt_sel.get(&tool).unwrap_or(&0);
-        self.opt_page = sel / self.opt_layout().per_page();
-        if tool == ToolKind::Stamp && from_click && self.stamp.is_none() {
-            self.open_drawer(LibKind::Stamps);
-        } else if tool != ToolKind::Stamp && self.drawer.as_ref().is_some_and(|d| d.kind == LibKind::Stamps) {
-            self.drawer = None;
+        self.rebuild_tray();
+        if changed && from_click {
+            self.shutter = Some(crate::panels::Shutter::new(&self.assets));
+        } else {
+            self.rebuild_panel();
         }
-        self.apply_option_state();
+        // A tool's tray replaces any open library tray.
+        self.drawer = None;
+        if tool == ToolKind::Brush {
+            self.update_sound_art();
+        } else {
+            self.sound_art = None;
+        }
         for b in self.buttons.iter_mut() {
             if let Some(t) = ToolKind::from_command(b.cmd) {
                 if t == tool {
@@ -354,42 +351,401 @@ impl Easel {
         }
     }
 
-    fn current_opt(&self) -> Option<&Opt> {
-        self.options.get(*self.opt_sel.get(&self.tool).unwrap_or(&0))
+    /// Panel art for the current tool and its state (docs/RE_PANELS.md §1.2, §3).
+    fn panel_layout(&self) -> crate::panels::Layout {
+        use crate::panels::Layout;
+        let v = self.tray().and_then(|t| t.group(G::Variant)).map(|g| g.sel).unwrap_or(0);
+        let small_kids = self.menu_state.small_kids;
+        let (background, mbtns, scroller): (u16, Vec<u16>, Option<(u16, usize)>) = match self.tool {
+            ToolKind::Pencil => (18044, vec![18400, 18200], None),
+            ToolKind::Brush => {
+                let mode = [18001, 18002, 18003][v.min(2)];
+                let sizes = if v < 2 { vec![18200] } else { vec![] };
+                (18045, [vec![18000, mode], sizes].concat(), Some((18022, 5)))
+            }
+            ToolKind::Fill => (18046, vec![18300], Some((18018, 7))),
+            ToolKind::Mixer => (18047, vec![18600, 18200], Some((18021, 6))),
+            ToolKind::Stamp => (18048, vec![18700, 18202], Some((18022, 5))),
+            ToolKind::Text if small_kids => (18039, vec![], Some((18000, 7))),
+            ToolKind::Text => (18049, vec![9383], None),
+            ToolKind::Mover => (18050, vec![926], if v == 1 { Some((18020, 6)) } else { None }),
+            ToolKind::Eraser => {
+                if v == 1 {
+                    (18051, vec![18500], Some((18024, 5)))
+                } else {
+                    let round = !matches!(self.item(G::Shape), Some(Item::EraserRound(false)));
+                    (18051, vec![18500, 18203, if round { 18200 } else { 18201 }], None)
+                }
+            }
+        };
+        Layout { background, mbtns, scroller }
     }
 
-    fn apply_option_state(&mut self) {
-        match self.current_opt().cloned() {
-            Some(Opt::StampSize(n)) => self.stamp_scale = n,
-            Some(Opt::TextSize(s)) => self.text_size = s,
-            Some(Opt::TextFont(i)) => self.text_font = i,
-            _ => {}
-        }
-    }
-
-    fn choose_option(&mut self, i: usize) {
-        if i >= self.options.len() {
+    fn rebuild_panel(&mut self) {
+        let layout = self.panel_layout();
+        if self.panel.as_ref().is_some_and(|p| p.layout == layout) {
             return;
         }
-        self.commit_text();
-        let opt = self.options[i].clone();
-        match opt {
-            Opt::Mix(m, _) => {
-                self.canvas.checkpoint();
-                paint::mix_canvas(&mut self.canvas.img, m, &mut self.rng);
+        self.panel = Some(crate::panels::Panel::new(&self.assets, layout));
+        let sel = self.panel_selection();
+        if let Some(p) = self.panel.as_mut() {
+            p.sync(&sel);
+        }
+    }
+
+    /// Which panel buttons show as chosen, from the tray state.
+    fn panel_selection(&self) -> Vec<bool> {
+        let Some(p) = &self.panel else { return vec![] };
+        let t = self.tray();
+        let sel = |g: G| t.and_then(|t| t.group(g)).map(|x| x.sel).unwrap_or(usize::MAX);
+        let shape = match self.item(G::Shape) {
+            Some(Item::Shape(s)) => Some(s),
+            _ => None,
+        };
+        let filled = matches!(self.item(G::FillMode), Some(Item::Filled(true)));
+        p.buttons
+            .iter()
+            .map(|b| match (self.tool, b.cmd) {
+                (ToolKind::Pencil, 18400) => sel(G::Variant) == b.value as usize,
+                (ToolKind::Pencil, 18450..=18458) => pencil_shape_cmd(shape, filled) == b.cmd,
+                (_, 18200) => sel(G::Size) + 1 == b.value as usize,
+                (ToolKind::Brush, 18000..=18002) => sel(G::Variant) == (b.cmd - 18000) as usize,
+                (ToolKind::Brush, 18003 | 18006 | 18007) => sel(G::Mode) == 0,
+                (ToolKind::Brush, 18004 | 18005 | 18008) => sel(G::Mode) == 1,
+                (ToolKind::Fill, 18300..=18302) => sel(G::Variant) == (b.cmd - 18300) as usize,
+                (ToolKind::Mixer, 18600 | 18601) => sel(G::Variant) == (b.cmd - 18600) as usize,
+                (ToolKind::Mover, 22301) => sel(G::Variant) == 0,
+                (ToolKind::Mover, 22300) => sel(G::Variant) == 1,
+                (ToolKind::Eraser, 18501) => sel(G::Variant) == 0,
+                (ToolKind::Eraser, 18500) => sel(G::Variant) == 1,
+                (ToolKind::Eraser, 18201) => sel(G::Shape) == 0,
+                (ToolKind::Eraser, 18202) => sel(G::Shape) == 1,
+                _ => false,
+            })
+            .collect()
+    }
+
+    fn set_sel(&mut self, g: G, i: usize) {
+        let restructure = trays::restructures(g, self.tool);
+        if let Some(grp) = self.trays.get_mut(&self.tool).and_then(|t| t.groups.iter_mut().find(|x| x.kind == g)) {
+            if i < grp.items.len() {
+                grp.sel = i;
             }
-            Opt::Eraser(k, _) if !matches!(k, EraserKind::Square(_)) => {
-                self.start_transition(k);
-                return;
+        }
+        if restructure {
+            self.rebuild_tray();
+        }
+    }
+
+    /// A panel button was pressed.
+    fn panel_command(&mut self, cmd: u16, value: u16) {
+        use crate::panels::{CMD_DOWN, CMD_UP};
+        match (self.tool, cmd) {
+            (_, CMD_UP | CMD_DOWN) => {
+                let n = self.panel.as_ref().map(|p| p.slots()).unwrap_or(1).max(1);
+                if let Some(g) = self.trays.get_mut(&self.tool).and_then(|t| t.groups.iter_mut().find(|g| g.kind == G::Options)) {
+                    let pages = g.items.len().div_ceil(n).max(1);
+                    g.page = if cmd == CMD_UP { (g.page + pages - 1) % pages } else { (g.page + 1) % pages };
+                }
             }
-            Opt::StampLibrary => {
-                self.open_drawer(LibKind::Stamps);
-                return;
+            (ToolKind::Pencil, 18400) => self.set_sel(G::Variant, value as usize),
+            (ToolKind::Pencil, 18450..=18458) => {
+                let (shape, filled) = match cmd {
+                    18450 => (Shape::Line, false),
+                    18451 => (Shape::Curve, false),
+                    18452 => (Shape::Rect, false),
+                    18453 => (Shape::Rect, true),
+                    18454 => (Shape::Oval, false),
+                    18455 => (Shape::Oval, true),
+                    18456 => (Shape::Polygon, false),
+                    18457 => (Shape::Polygon, true),
+                    _ => (Shape::Freehand, false),
+                };
+                let si = [Shape::Freehand, Shape::Curve, Shape::Line, Shape::Rect, Shape::Oval, Shape::Polygon].iter().position(|&s| s == shape).unwrap_or(0);
+                self.set_sel(G::Shape, si);
+                self.set_sel(G::FillMode, if filled { 0 } else { 1 });
+            }
+            (_, 18200) => self.set_sel(G::Size, value.saturating_sub(1) as usize),
+            (ToolKind::Brush, 18000..=18002) => self.set_sel(G::Variant, (cmd - 18000) as usize),
+            (ToolKind::Brush, 18003 | 18006 | 18007) => self.set_sel(G::Mode, 0),
+            (ToolKind::Brush, 18004 | 18005 | 18008) => self.set_sel(G::Mode, 1),
+            (ToolKind::Fill, 18300..=18302) => self.set_sel(G::Variant, (cmd - 18300) as usize),
+            (ToolKind::Mixer, 18600 | 18601) => self.set_sel(G::Variant, (cmd - 18600) as usize),
+            (ToolKind::Stamp, 18703 | 18704 | 18702) => {
+                let n = self.assets.libraries("Libraries/Stamps").len().max(1);
+                self.stamp_folder = match cmd {
+                    18703 => self.stamp_folder.saturating_sub(1),
+                    18704 => (self.stamp_folder + 1).min(n - 1),
+                    _ => (self.stamp_folder + 1) % n,
+                };
+                if let Some(g) = self.trays.get_mut(&ToolKind::Stamp).and_then(|t| t.groups.iter_mut().find(|g| g.kind == G::Options)) {
+                    g.sel = 0;
+                    g.page = 0;
+                }
+                self.rebuild_tray();
+            }
+            (ToolKind::Stamp, 18701) => self.actions.push(Action::StampEditor),
+            (ToolKind::Stamp, 18202) => self.set_sel(G::Size, value.saturating_sub(1) as usize),
+            (ToolKind::Mover, 22301) => self.set_sel(G::Variant, 0),
+            (ToolKind::Mover, 22300) => self.set_sel(G::Variant, 1),
+            (ToolKind::Mover, 22352) => {
+                if let Some(i) = self.selected.take().filter(|&i| i < self.objects.len()) {
+                    self.objects.remove(i);
+                }
+            }
+            (ToolKind::Mover, 22350) => {
+                if let Some(mut o) = self.selected.and_then(|i| self.objects.get(i)).cloned() {
+                    o.x += 12;
+                    o.y += 12;
+                    self.objects.push(o);
+                    self.selected = Some(self.objects.len() - 1);
+                }
+            }
+            (ToolKind::Mover, 22351) => self.flatten_objects(),
+            (ToolKind::Eraser, 18501) => self.set_sel(G::Variant, 0),
+            (ToolKind::Eraser, 18500) => self.set_sel(G::Variant, 1),
+            (ToolKind::Eraser, 18201) => self.set_sel(G::Shape, 0),
+            (ToolKind::Eraser, 18202) => self.set_sel(G::Shape, 1),
+            (ToolKind::Text, c) => self.text_panel_command(c),
+            _ => {}
+        }
+        self.rebuild_panel();
+        let sel = self.panel_selection();
+        if let Some(p) = self.panel.as_mut() {
+            p.sync(&sel);
+        }
+        if self.tool == ToolKind::Brush {
+            self.update_sound_art();
+        }
+    }
+
+    fn text_panel_command(&mut self, cmd: u16) {
+        const SIZES: [f32; 14] = [7.0, 9.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 28.0, 32.0, 48.0, 72.0];
+        let nf = self.fonts.faces.iter().filter(|(n, _)| n != "System").count().max(1);
+        match cmd {
+            200 => self.text_font = (self.text_font + nf - 1) % nf,
+            201 => self.text_font = (self.text_font + 1) % nf,
+            202 | 203 => {
+                let i = SIZES.iter().position(|&z| z >= self.text_size).unwrap_or(5);
+                let j = if cmd == 202 { (i + 1).min(SIZES.len() - 1) } else { i.saturating_sub(1) };
+                self.text_size = SIZES[j];
+            }
+            232 => {
+                if let Some(t) = &self.text {
+                    crate::speech::speak(&t.text, 0);
+                }
             }
             _ => {}
         }
-        self.opt_sel.insert(self.tool, i);
-        self.apply_option_state();
+        if self.text.is_some() {
+            self.render_text();
+        }
+    }
+
+    fn tray(&self) -> Option<&Tray> {
+        self.trays.get(&self.tool)
+    }
+
+    fn item(&self, g: G) -> Option<Item> {
+        self.tray()?.get(g).cloned()
+    }
+
+    fn rebuild_tray(&mut self) {
+        let prev = self.trays.get(&self.tool).cloned();
+        let mut t = trays::build(self.tool, &self.assets, self.fonts.faces.len(), prev.as_ref());
+        if self.tool == ToolKind::Stamp {
+            self.load_stamp_folder(&mut t);
+        }
+        self.tray_icons = t
+            .groups
+            .iter()
+            .map(|g| {
+                g.items
+                    .iter()
+                    .map(|it| match it {
+                        Item::Stamp(id) => self.stamp_icon(*id),
+                        _ => trays::icon(it, &self.assets, &self.pads, &self.fonts, OPT_ICON),
+                    })
+                    .collect()
+            })
+            .collect();
+        if let Some(Item::TextSize(z)) = t.get(G::Size) {
+            self.text_size = *z;
+        }
+        if let Some(Item::TextFont(f)) = t.get(G::Size) {
+            self.text_font = *f;
+        }
+        self.trays.insert(self.tool, t);
+    }
+
+    fn load_stamp_folder(&mut self, t: &mut Tray) {
+        let libs = self.assets.libraries("Libraries/Stamps");
+        if libs.is_empty() {
+            return;
+        }
+        self.stamp_folder %= libs.len();
+        self.stamp_archive = mohawk::Archive::open(&libs[self.stamp_folder]).ok();
+        let ids = self.stamp_archive.as_ref().map(|a| a.ids(assets::T_BMP)).unwrap_or_default();
+        if let Some(g) = t.groups.iter_mut().find(|g| g.kind == G::Options) {
+            g.items = ids.into_iter().map(Item::Stamp).collect();
+            g.sel = g.sel.min(g.items.len().saturating_sub(1));
+            g.page = g.page.min(g.items.len() / 20);
+        }
+    }
+
+    fn stamp_image_by_id(&self, id: u16) -> Option<Image> {
+        crate::library::decode_stamp(self.stamp_archive.as_ref()?.get(assets::T_BMP, id)?)
+    }
+
+    fn stamp_icon(&self, id: u16) -> Image {
+        let mut out = Image::filled(OPT_ICON, OPT_ICON, WHITE);
+        if let Some(s) = self.stamp_image_by_id(id) {
+            gfx::blit(&mut out, &s, (OPT_ICON as i32 - s.width as i32) / 2, (OPT_ICON as i32 - s.height as i32) / 2);
+        }
+        out
+    }
+
+    fn stamp_folder_name(&self) -> String {
+        self.assets
+            .libraries("Libraries/Stamps")
+            .get(self.stamp_folder)
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
+
+    /// A click on tray group `gi`, item `ii`.
+    fn tray_choose(&mut self, gi: usize, ii: usize) {
+        self.commit_text();
+        let Some(t) = self.trays.get_mut(&self.tool) else { return };
+        let Some(g) = t.groups.get_mut(gi) else { return };
+        let Some(item) = g.items.get(ii).cloned() else { return };
+        let kind = g.kind;
+        if !trays::one_shot(&item) {
+            g.sel = ii;
+        }
+        match item {
+            Item::GrabAct(GrabAction::Trash) => {
+                if let Some(i) = self.selected.take().filter(|&i| i < self.objects.len()) {
+                    self.objects.remove(i);
+                }
+            }
+            Item::GrabAct(GrabAction::Copy) => self.copy(),
+            Item::GrabAct(GrabAction::Paste) => {
+                if self.clipboard.is_some() {
+                    self.stroke = Stroke::PasteAim;
+                }
+            }
+            Item::StampEditor => self.actions.push(Action::StampEditor),
+            Item::Letter(id) => self.play_wav(tools::TP, id, audio::CH_TOOL),
+            _ => {}
+        }
+        if trays::restructures(kind, self.tool) {
+            self.rebuild_tray();
+        } else if let Some(Item::TextSize(z)) = self.item(G::Size) {
+            self.text_size = z;
+        }
+        if let Some(Item::TextFont(f)) = self.item(G::Size) {
+            self.text_font = f;
+        }
+        if self.tool == ToolKind::Brush {
+            self.update_sound_art();
+        }
+    }
+
+    /// Sound Art needs the microphone while it is the selected painting tool.
+    fn update_sound_art(&mut self) {
+        let want = self.tool == ToolKind::Brush && matches!(self.item(G::Variant), Some(Item::Paint(PaintTool::SoundArt)));
+        if want && self.sound_art.is_none() {
+            match crate::record::Recorder::start(36000.0) {
+                Ok(r) => self.sound_art = Some(r),
+                Err(e) => self.message(format!("Sound Art needs a microphone: {e}")),
+            }
+        } else if !want {
+            self.sound_art = None;
+        }
+    }
+
+    /// Icons for the panel scroller's visible slots.
+    fn scroller_icons(&self) -> (Vec<Option<Image>>, Option<usize>, usize, usize) {
+        let n = self.panel.as_ref().map(|p| p.slots()).unwrap_or(0);
+        let Some((gi, g)) = self.tray().and_then(|t| t.groups.iter().enumerate().find(|(_, g)| g.kind == G::Options)) else {
+            return (vec![], None, 0, 0);
+        };
+        if n == 0 {
+            return (vec![], None, 0, 0);
+        }
+        let pages = g.items.len().div_ceil(n).max(1);
+        let page = g.page.min(pages - 1);
+        let start = page * n;
+        let icons = (start..(start + n).min(g.items.len()))
+            .map(|i| self.tray_icons.get(gi).and_then(|v| v.get(i)).cloned())
+            .collect();
+        let sel = (g.sel >= start && g.sel < start + n).then(|| g.sel - start);
+        (icons, sel, page, pages)
+    }
+
+    fn panel_click(&mut self, x: i32, y: i32) -> bool {
+        if self.drawer.is_some() || self.shutter.is_some() {
+            return false;
+        }
+        let Some(p) = self.panel.as_mut() else { return false };
+        if let Some(i) = p.button_at(x, y) {
+            let (cmd, value) = p.press(i, &self.assets, &self.audio, self.menu_state.tool_sounds);
+            self.panel_command(cmd, value);
+            return true;
+        }
+        if let Some(k) = p.slot_at(x, y) {
+            let n = p.slots();
+            if let Some(gi) = self.tray().and_then(|t| t.groups.iter().position(|g| g.kind == G::Options)) {
+                let page = self.tray().map(|t| t.groups[gi].page).unwrap_or(0);
+                let idx = page * n + k;
+                if idx < self.tray().map(|t| t.groups[gi].items.len()).unwrap_or(0) {
+                    self.tray_choose(gi, idx);
+                }
+            }
+            return true;
+        }
+        ui::hit(x, y, 90, 500, 650, 100)
+    }
+
+    fn draw_tray(&self, frame: &mut Image) {
+        if self.drawer.is_some() {
+            return;
+        }
+        if let Some(p) = &self.panel {
+            if self.shutter.as_ref().is_none_or(|s| s.swapped) {
+                let (icons, sel, page, pages) = self.scroller_icons();
+                let refs: Vec<Option<&Image>> = icons.iter().map(|o| o.as_ref()).collect();
+                p.draw(frame, &refs, sel, page, pages);
+                self.draw_panel_fields(frame);
+            }
+        }
+        if let Some(s) = &self.shutter {
+            s.draw(frame);
+        }
+    }
+
+    /// Text fields of the panels: stamp library name, text font/size/voice.
+    fn draw_panel_fields(&self, frame: &mut Image) {
+        if self.fonts.is_empty() {
+            return;
+        }
+        let vogel = self.fonts.faces.iter().position(|(n, _)| n.to_uppercase().starts_with("VOGEN") || n.eq_ignore_ascii_case("vogel")).unwrap_or_else(|| self.fonts.ui_face());
+        let ink = gfx::rgb(0, 0, 0);
+        match self.tool {
+            ToolKind::Stamp => {
+                self.fonts.draw_centered(frame, vogel, 16.0, 181.0, 564.0, 130.0, ink, &self.stamp_folder_name());
+            }
+            ToolKind::Text if !self.menu_state.small_kids => {
+                let fname = self.fonts.faces.get(self.text_font).map(|f| f.0.clone()).unwrap_or_default();
+                self.fonts.draw_centered(frame, vogel, 13.0, 164.0, 544.0, 106.0, ink, &fname);
+                self.fonts.draw_centered(frame, vogel, 13.0, 254.0, 544.0, 26.0, ink, &format!("{}", self.text_size as i32));
+                let voice = if crate::speech::available() { "Computer" } else { "-" };
+                self.fonts.draw_centered(frame, vogel, 13.0, 513.0, 558.0, 106.0, ink, voice);
+            }
+            _ => {}
+        }
     }
 
     // ------------------------------------------------------------------ library drawer
@@ -432,6 +788,10 @@ impl Easel {
                     }
                 }
             }
+            LibKind::Paper => {
+                self.paper = if id == 0 { None } else { d.full_bitmap(id).map(Rc::new) };
+                self.canvas.dirty = true;
+            }
             LibKind::Stickers | LibKind::Toons => {
                 let (frames, fps, src) = d.movie_frames(id, kind == LibKind::Toons);
                 if !frames.is_empty() {
@@ -455,22 +815,31 @@ impl Easel {
             223 => self.open_drawer(LibKind::Toons),
             225 => self.open_drawer(LibKind::Sounds),
             281 => self.actions.push(Action::Save),
-            242 => self.actions.push(Action::SaveAs),
-            267 => self.actions.push(Action::New),
+            242 => self.actions.push(Action::Print),
+            267 => self.actions.push(Action::Quit),
+            NEW_PICTURE_CMD => self.actions.push(Action::New),
             243 => {
                 self.playing = true;
-                if let Some(s) = &self.page_sound {
+                self.movie_time = 0.0;
+                if let Some(s) = self.page_sound.as_ref().filter(|_| self.menu_state.attached_sound) {
                     self.audio.play(s.clone(), audio::CH_MUSIC, false);
+                }
+                for o in &self.objects {
+                    if let Some(a) = o.movie.as_ref().and_then(|m| m.audio.clone()) {
+                        self.audio.play(std::sync::Arc::new(a), audio::CH_FX, false);
+                    }
                 }
             }
             244 => {
                 self.playing = false;
                 self.audio.stop_channel(audio::CH_MUSIC);
+                self.audio.stop_channel(audio::CH_FX);
             }
             266 => {
                 // Dynamite: the click script plays the explosion; clear when it ends.
                 self.dynamite_clear = true;
             }
+            238 => self.open_drawer(LibKind::Paper),
             239 => self.message(
                 "Pick a tool on the left, choose a color at the bottom left, then draw! \
                  Click the face to undo. Hover over any button to see its name.",
@@ -518,7 +887,7 @@ impl Easel {
         self.commit_text();
         let mut img = self.canvas.img.clone();
         for o in &self.objects {
-            gfx::blit(&mut img, o.frame(false), o.x, o.y);
+            gfx::blit(&mut img, &o.current(self.playing, self.movie_time), o.x, o.y);
         }
         img
     }
@@ -586,25 +955,22 @@ impl Easel {
     pub fn wheel(&mut self, steps: f32) {
         let (x, y) = self.mouse;
         let Some(i) = self.object_at(x, y) else { return };
-        let o = &mut self.objects[i];
-        let new_zoom = (o.zoom * 1.12f32.powf(steps)).clamp(0.2, 5.0);
-        let (ow, oh) = o.size();
-        let (cx, cy) = (o.x + ow / 2, o.y + oh / 2);
-        let frames = match &o.source {
-            Some(src) => crate::stickers::render(src, o.frames.len() > 1, new_zoom).map(|r| r.0),
-            None => {
-                let f = new_zoom / o.zoom;
-                Some(o.frames.iter().map(|im| gfx::resize(im, ((im.width as f32 * f) as u32).max(4), ((im.height as f32 * f) as u32).max(4))).collect())
-            }
+        let z = self.objects[i].zoom * 1.12f32.powf(steps);
+        self.objects[i].rescale(z);
+        self.canvas.dirty = true;
+    }
+
+    fn finish_scale(&mut self, i: usize, h: Handle, z0: f32, sx: i32, sy: i32, cx: i32, cy: i32) {
+        let Some(o) = self.objects.get(i) else { return };
+        let (w, hgt) = o.size();
+        let d = match h {
+            Handle::ScaleBR => ((cx - sx) + (cy - sy)) as f32 / 2.0,
+            _ => ((sx - cx) + (sy - cy)) as f32 / 2.0,
         };
-        if let Some(frames) = frames {
-            o.frames = frames;
-            o.zoom = new_zoom;
-            let (nw, nh) = o.size();
-            o.x = cx - nw / 2;
-            o.y = cy - nh / 2;
-            self.canvas.dirty = true;
-        }
+        let base = (w.max(hgt) as f32).max(1.0);
+        let z = z0 * ((base + d) / base).max(0.1);
+        self.objects[i].rescale(z);
+        self.canvas.dirty = true;
     }
 
     /// Delete key: remove the sticker under the mouse.
@@ -612,8 +978,11 @@ impl Easel {
         if self.text.is_some() {
             return;
         }
-        if let Some(i) = self.object_at(self.mouse.0, self.mouse.1) {
-            self.objects.remove(i);
+        if let Some(i) = self.selected.take().or_else(|| self.object_at(self.mouse.0, self.mouse.1)) {
+            if i < self.objects.len() {
+                self.objects.remove(i);
+                self.canvas.dirty = true;
+            }
         }
     }
 
@@ -649,6 +1018,9 @@ impl Easel {
 
     /// Play (243) and Stop (244) share one spot: only one is live at a time.
     fn button_visible(&self, b: &UiButton) -> bool {
+        if self.menu_state.small_kids && matches!(b.cmd, 242 | 270) {
+            return false; // printing and SlideShow are hidden in Small Kids Mode
+        }
         match b.cmd {
             243 => !self.playing,
             244 => self.playing,
@@ -666,23 +1038,28 @@ impl Easel {
         let (cx, cy) = (x - CANVAS_X, y - CANVAS_Y);
         self.objects.iter().rposition(|o| {
             let (w, h) = o.size();
-            ui::hit(cx, cy, o.x, o.y, w, h) && o.frame(false).get(cx - o.x, cy - o.y).is_some_and(|p| p >> 24 > 16)
+            ui::hit(cx, cy, o.x, o.y, w, h) && o.hit(cx - o.x, cy - o.y)
         })
     }
 
     pub fn mouse_move(&mut self, x: i32, y: i32) {
         let prev = self.mouse;
         self.mouse = (x, y);
+        self.menubar.motion(&self.fonts, &self.menu_state, x, y);
+        if self.menu_press || self.menubar.open.is_some() {
+            return;
+        }
+        self.picker.mouse_move(x, y, &self.assets, &self.audio, self.menu_state.tool_sounds);
+        let sel = self.panel_selection();
+        if let Some(p) = self.panel.as_mut() {
+            p.mouse_move(x, y, &self.assets, &self.audio, self.menu_state.tool_sounds, &sel);
+        }
+        if self.picker.eyedropper {
+            self.dropper_preview = Self::in_canvas(x, y).then(|| self.canvas.img.get(x - CANVAS_X, y - CANVAS_Y)).flatten();
+        }
         if let Some(ss) = self.slideshow.as_mut() {
             ss.mouse_move(x, y);
             return;
-        }
-        if let Overlay::Menu(_) = self.overlay {
-            if y < 18 {
-                if let Some(i) = MENU_X.iter().rposition(|&mx| x >= mx - 4) {
-                    self.overlay = Overlay::Menu(i);
-                }
-            }
         }
         // Button rollover: field 1 plays (with its sounds) on enter, rest script on leave.
         let hb = if self.down { self.hover_btn } else { self.button_at(x, y) };
@@ -703,6 +1080,7 @@ impl Easel {
             self.hover_time = 0.0;
         }
         if !self.down {
+            self.hover_stroke(x, y);
             return;
         }
         if let Some((i, gx, gy)) = self.drag_obj {
@@ -713,6 +1091,28 @@ impl Easel {
             return;
         }
         self.stroke_to(prev, (x, y));
+    }
+
+    /// Strokes that follow the mouse between clicks (curve bending, polygon corners).
+    fn hover_stroke(&mut self, x: i32, y: i32) {
+        let (fx, fy) = ((x - CANVAS_X) as f32 + 0.5, (y - CANVAS_Y) as f32 + 0.5);
+        match std::mem::replace(&mut self.stroke, Stroke::None) {
+            Stroke::CurveBend { a, b, pen, base, .. } => {
+                self.canvas.img = base.clone();
+                let pts = paint::curve_points(a, (fx, fy), b);
+                self.stroke_path(&pts, &pen, false);
+                self.stroke = Stroke::CurveBend { a, b, ctrl: (fx, fy), pen, base };
+            }
+            Stroke::Polygon { pts, filled, pen, base, .. } => {
+                self.canvas.img = base.clone();
+                let mut p = pts.clone();
+                p.push((fx, fy));
+                self.stroke_path(&p, &pen, false);
+                self.stroke = Stroke::Polygon { pts, cur: (fx, fy), filled, pen, base };
+            }
+            Stroke::CutPolygon { pts, .. } => self.stroke = Stroke::CutPolygon { pts, cur: (fx, fy) },
+            other => self.stroke = other,
+        }
     }
 
     fn button_sounds(&mut self, i: usize) -> Vec<u16> {
@@ -726,6 +1126,16 @@ impl Easel {
 
     pub fn mouse_down(&mut self, x: i32, y: i32) {
         self.mouse = (x, y);
+        if let Some(p) = self.about.take() {
+            let _ = p;
+            return;
+        }
+        {
+            if self.menubar.press(x, y) {
+                self.menu_press = true;
+                return;
+            }
+        }
         if let Some(ss) = self.slideshow.as_mut() {
             if let Some(SlideAction::AddCurrent) = ss.mouse_down(x, y) {
                 let img = self.flattened();
@@ -743,32 +1153,24 @@ impl Easel {
             return;
         }
         self.down = true;
-        // Menus.
-        if let Overlay::Menu(m) = self.overlay {
-            self.overlay = Overlay::None;
-            if let Some(item) = self.menu_item_at(m, x, y) {
-                self.menu_command(m, item);
+        if let Overlay::Fit(..) = self.overlay {
+            self.fit_click(x, y);
+            self.down = false;
+            return;
+        }
+        if let Some(pick) = self.picker.press(x, y, &self.assets, &self.audio, self.menu_state.tool_sounds) {
+            if let crate::colorpicker::Pick::Color(c) = pick {
+                self.set_color(c);
             }
             self.down = false;
             return;
         }
-        if y < 18 {
-            if let Some(i) = MENU_X.iter().rposition(|&mx| x >= mx - 4) {
-                if x < 190 {
-                    self.overlay = Overlay::Menu(i);
-                    self.down = false;
-                    return;
-                }
+        if self.picker.eyedropper {
+            self.picker.eyedropper = false;
+            if let Some(c) = Self::in_canvas(x, y).then(|| self.canvas.img.get(x - CANVAS_X, y - CANVAS_Y)).flatten() {
+                self.set_color(c | 0xff00_0000);
             }
-        }
-        if let Overlay::Palette = self.overlay {
-            self.overlay = Overlay::None;
-            if let Some(c) = self.palette_at(x, y) {
-                self.color = c;
-                if self.text.is_some() {
-                    self.render_text();
-                }
-            }
+            self.dropper_preview = None;
             self.down = false;
             return;
         }
@@ -785,21 +1187,19 @@ impl Easel {
             self.down = false;
             return;
         }
-        // Option panel.
-        if ui::hit(x, y, OPT_X - 4, OPT_Y - 6, 400, 64) {
-            self.options_click(x, y);
+        // Tool tray (bottom panels).
+        if self.panel_click(x, y) {
             self.down = false;
             return;
         }
-        // Color picker.
+        // The splotch area itself (the picker opens on hover).
         if ui::hit(x, y, COLOR_RECT.0, COLOR_RECT.1, COLOR_RECT.2, COLOR_RECT.3) {
-            self.overlay = Overlay::Palette;
             self.down = false;
             return;
         }
         // Undo face.
         if ui::hit(x, y, FACE_RECT.0, FACE_RECT.1, FACE_RECT.2, FACE_RECT.3) {
-            self.undo();
+            self.undo_redo();
             self.down = false;
             return;
         }
@@ -818,38 +1218,22 @@ impl Easel {
         }
     }
 
-    pub fn mouse_up(&mut self, _x: i32, _y: i32) {
+    pub fn mouse_up(&mut self, x: i32, y: i32) {
+        if let Some((i, h, z0, sx, sy)) = self.scale_drag.take() {
+            self.finish_scale(i, h, z0, sx, sy, x - CANVAS_X, y - CANVAS_Y);
+            self.down = false;
+            return;
+        }
+        if self.menu_press {
+            self.menu_press = false;
+            if let Some(id) = self.menubar.release(&self.fonts, &self.menu_state, x, y) {
+                self.menu_command(id);
+            }
+            return;
+        }
         self.down = false;
         self.drag_obj = None;
-        match std::mem::replace(&mut self.stroke, Stroke::None) {
-            Stroke::MoverSelect { start, cur, copy } => {
-                let (x0, y0) = (start.0.min(cur.0), start.1.min(cur.1));
-                let (x1, y1) = (start.0.max(cur.0), start.1.max(cur.1));
-                if x1 - x0 > 2 && y1 - y0 > 2 {
-                    let piece = gfx::crop(&self.canvas.img, x0, y0, x1 - x0, y1 - y0);
-                    self.canvas.checkpoint();
-                    if !copy {
-                        gfx::fill_rect(&mut self.canvas.img, x0, y0, x1 - x0, y1 - y0, WHITE);
-                    }
-                    // The lifted piece becomes a movable object until the next action.
-                    self.objects.push(PageObj {
-                        frames: vec![piece],
-                        fps: 1.0,
-                        x: x0,
-                        y: y0,
-                        t: 0.0,
-                        source: None,
-                        zoom: 1.0,
-                    });
-                    self.message("Drag the piece where you want it.");
-                }
-            }
-            other => {
-                if !matches!(other, Stroke::None) {
-                    self.canvas.dirty = true;
-                }
-            }
-        }
+        self.stroke_up();
     }
 
     fn canvas_down(&mut self, x: i32, y: i32) {
@@ -861,126 +1245,237 @@ impl Easel {
                 self.message("That's a lot of stickers! Remove one first.");
             } else {
                 let (w, h) = (frames[0].width as i32, frames[0].height as i32);
-                self.objects.push(PageObj { frames, fps, x: cx - w / 2, y: cy - h / 2, t: 0.0, source, zoom: 1.0 });
+                let movie = self.armed_movie.take();
+                if movie.is_some() {
+                    // One movie per picture: a new one replaces the old.
+                    self.objects.retain(|o| o.movie.is_none());
+                }
+                self.objects.push(PageObj::new(frames, fps, cx - w / 2, cy - h / 2, source, movie));
+                self.selected = Some(self.objects.len() - 1);
                 self.canvas.dirty = true;
             }
             self.down = false;
             return;
         }
-        // Dragging objects: Moving Van (any option) or eraser click removes.
-        if let Some(i) = self.object_at(x, y) {
-            match self.tool {
-                ToolKind::Mover => {
-                    let o = &self.objects[i];
-                    self.drag_obj = Some((i, cx - o.x, cy - o.y));
-                    return;
+        // Edit-frame handles of the selected object.
+        if let Some(i) = self.selected.filter(|&i| i < self.objects.len()) {
+            if let Some(h) = self.objects[i].handle_at(cx, cy) {
+                match h {
+                    Handle::ScaleTL | Handle::ScaleBR => self.scale_drag = Some((i, h, self.objects[i].zoom, cx, cy)),
+                    Handle::FlipH => self.objects[i].flip_h = !self.objects[i].flip_h,
+                    Handle::FlipV => self.objects[i].flip_v = !self.objects[i].flip_v,
+                    Handle::Loop => self.objects[i].looping = !self.objects[i].looping,
+                    Handle::Step => self.objects[i].step(),
                 }
-                ToolKind::Eraser => {
-                    self.objects.remove(i);
-                    self.down = false;
-                    return;
-                }
-                _ => {}
+                self.canvas.dirty = true;
+                return;
             }
         }
-        let opt = self.current_opt().cloned();
+        // Objects float above the picture: clicking one selects it and drags it.
+        if let Some(i) = self.object_at(x, y) {
+            let o = &self.objects[i];
+            self.drag_obj = Some((i, cx - o.x, cy - o.y));
+            self.selected = Some(i);
+            return;
+        }
+        self.selected = None;
+        if let Stroke::PasteAim = self.stroke {
+            self.stroke = Stroke::None;
+            if let Some(mut o) = self.clipboard.clone() {
+                let (w, h) = o.size();
+                o.x = cx - w / 2;
+                o.y = cy - h / 2;
+                self.objects.push(o);
+                self.selected = Some(self.objects.len() - 1);
+                self.canvas.dirty = true;
+            }
+            self.down = false;
+            return;
+        }
+        // Clicks that continue a multi-click shape.
+        match std::mem::replace(&mut self.stroke, Stroke::None) {
+            Stroke::CurveBend { a, b, pen, base, .. } => {
+                self.canvas.img = base;
+                let pts = paint::curve_points(a, (fx, fy), b);
+                self.stroke_path(&pts, &pen, false);
+                self.down = false;
+                return;
+            }
+            Stroke::Polygon { mut pts, filled, pen, base, .. } => {
+                let first = pts[0];
+                let close = pts.len() >= 3 && ((first.0 - fx).powi(2) + (first.1 - fy).powi(2)).sqrt() < 8.0;
+                if close {
+                    self.canvas.img = base;
+                    if filled {
+                        paint::fill_polygon(&mut self.canvas.img, &pts, self.color);
+                    }
+                    self.stroke_path(&pts, &pen, true);
+                } else {
+                    pts.push((fx, fy));
+                    self.stroke = Stroke::Polygon { pts, cur: (fx, fy), filled, pen, base };
+                }
+                self.down = false;
+                return;
+            }
+            Stroke::CutPolygon { mut pts, .. } => {
+                let first = pts[0];
+                if pts.len() >= 3 && ((first.0 - fx).powi(2) + (first.1 - fy).powi(2)).sqrt() < 8.0 {
+                    self.cut_out(&pts);
+                } else {
+                    pts.push((fx, fy));
+                    self.stroke = Stroke::CutPolygon { pts, cur: (fx, fy) };
+                }
+                self.down = false;
+                return;
+            }
+            other => self.stroke = other,
+        }
+        let size = self.tray().map(|t| t.size_idx()).unwrap_or(1) as f32;
         match self.tool {
-            ToolKind::Pencil => match opt {
-                Some(Opt::Media(sec, _)) => {
-                    self.canvas.checkpoint();
-                    let params = tools::media_params(&self.assets, sec);
-                    let pad = tools::pad_for(&self.pads, &params, 6.0);
-                    let mut st = MediaStroke::new(params, pad, self.rng.next_u32() as u64);
-                    st.to(&mut self.canvas.img, fx, fy, self.color);
-                    self.stroke = Stroke::Media(st);
-                    let snd = self.felt_sound();
-                    self.play_wav("Data/Tools/FeltPenSnds.MHK", snd, audio::CH_TOOL);
+            ToolKind::Pencil => {
+                let pen = self.current_pen();
+                let shape = match self.item(G::Shape) {
+                    Some(Item::Shape(k)) => k,
+                    _ => Shape::Freehand,
+                };
+                let filled = matches!(self.item(G::FillMode), Some(Item::Filled(true)));
+                self.canvas.checkpoint();
+                match shape {
+                    Shape::Freehand => match pen {
+                        Pen::Pencil(w) => {
+                            paint::line(&mut self.canvas.img, fx, fy, fx, fy, w, self.color);
+                            self.stroke = Stroke::Pencil { last: (fx, fy), width: w };
+                        }
+                        Pen::Media(params, pad, paper) => {
+                            let mut st = MediaStroke::new(params, pad, self.rng.next_u32() as u64);
+                            st.paper = paper;
+                            st.to(&mut self.canvas.img, fx, fy, self.color);
+                            self.stroke = Stroke::Media(st);
+                            let snd = self.felt_sound();
+                            self.play_wav("Data/Tools/FeltPenSnds.MHK", snd, audio::CH_TOOL);
+                        }
+                    },
+                    Shape::Polygon => {
+                        self.stroke = Stroke::Polygon { pts: vec![(fx, fy)], cur: (fx, fy), filled, pen, base: self.canvas.img.clone() };
+                        self.down = false;
+                    }
+                    _ => {
+                        self.stroke = Stroke::ShapeDrag { shape, start: (fx, fy), cur: (fx, fy), filled, pen, base: self.canvas.img.clone() };
+                    }
+                }
+            }
+            ToolKind::Brush => match self.item(G::Variant) {
+                Some(Item::Paint(PaintTool::Spray)) => {
+                    let (arch, id, moving) = match self.item(G::Options) {
+                        Some(Item::SprayMoving(id)) => (tools::ANIMS, id, true),
+                        Some(Item::Spray3D(id)) => (tools::CYCLIC, id, false),
+                        _ => return,
+                    };
+                    if let Some(set) = self.assets.sprites(arch, id) {
+                        self.canvas.checkpoint();
+                        self.stroke = Stroke::Spray { set, moving, rng: Rng::new(self.rng.next_u32() as u64), pos: (fx, fy), acc: 1.0, cel: 0, radius: 8.0 + size * 10.0 };
+                        self.play_brush_sound();
+                    }
+                }
+                Some(Item::Paint(PaintTool::SoundArt)) => {
+                    if !matches!(self.item(G::Mode), Some(Item::HandsFree(true))) {
+                        self.canvas.checkpoint();
+                        self.stroke = Stroke::SoundArt { last: (fx, fy), hue: 0.0 };
+                    }
                 }
                 _ => {
-                    let width = match opt {
-                        Some(Opt::PencilSize(w)) => w,
-                        _ => 3.0,
-                    };
                     self.canvas.checkpoint();
-                    paint::line(&mut self.canvas.img, fx, fy, fx, fy, width, self.color);
-                    self.stroke = Stroke::Pencil { last: (fx, fy), width };
-                }
-            },
-            ToolKind::Brush => {
-                let kind = match opt {
-                    Some(Opt::Wacky(k, _)) => k,
-                    _ => Wacky::Rainbow,
-                };
-                self.canvas.checkpoint();
-                let media = match kind {
-                    Wacky::Custom(n) => {
-                        let p = tools::media_params(&self.assets, &format!("CustomBrush{n}"));
-                        let pad = tools::pad_for(&self.pads, &p, 8.0);
-                        Some(MediaStroke::new(p, pad, self.rng.next_u32() as u64))
-                    }
-                    Wacky::Drippy => {
-                        let p = tools::media_params(&self.assets, "Drippy");
-                        let pad = tools::pad_for(&self.pads, &p, 8.0);
-                        Some(MediaStroke::new(p, pad, self.rng.next_u32() as u64))
-                    }
-                    _ => None,
-                };
-                if let Some(key) = tools::trail_source(kind) {
-                    if !self.trails.contains_key(&key) {
-                        if let Some(s) = self.assets.sprites(key.0, key.1) {
-                            self.trails.insert(key, s);
+                    let scale = [0.6, 1.0, 1.6][size.clamp(0.0, 2.0) as usize];
+                    match self.item(G::Options) {
+                        Some(Item::Real(sec)) => {
+                            let p = tools::media_params(&self.assets, &sec);
+                            let pad = tools::pad_for(&self.pads, &p, 8.0).scaled(scale);
+                            let mut st = MediaStroke::new(p, pad, self.rng.next_u32() as u64);
+                            st.paper = self.paper.clone();
+                            st.to(&mut self.canvas.img, fx, fy, self.color);
+                            self.stroke = Stroke::Media(st);
+                        }
+                        other => {
+                            let kind = match other {
+                                Some(Item::Brush(k)) => k,
+                                _ => Wacky::Rainbow,
+                            };
+                            let media = match kind {
+                                Wacky::Drippy => {
+                                    let p = tools::media_params(&self.assets, "Drippy");
+                                    let pad = tools::pad_for(&self.pads, &p, 8.0).scaled(scale);
+                                    Some(MediaStroke::new(p, pad, self.rng.next_u32() as u64))
+                                }
+                                _ => None,
+                            };
+                            let mut st = Stroke::Wacky { kind, last: (fx, fy), dist: 1000.0, rng: Rng::new(self.rng.next_u32() as u64), hue: 0.0, cel: 0, media };
+                            self.wacky_apply(&mut st, (fx, fy));
+                            self.stroke = st;
                         }
                     }
+                    self.play_brush_sound();
                 }
-                let mut st = Stroke::Wacky {
-                    kind,
-                    last: (fx, fy),
-                    dist: 1000.0,
-                    rng: Rng::new(self.rng.next_u32() as u64),
-                    hue: 0.0,
-                    cel: 0,
-                    media,
-                };
-                self.wacky_apply(&mut st, (fx, fy));
-                self.stroke = st;
-                self.play_brush_sound();
-            }
+            },
             ToolKind::Fill => {
-                let kind = match opt {
-                    Some(Opt::Fill(k, _)) => k,
-                    _ => FillKind::Solid,
+                let kind = match self.item(G::Options) {
+                    Some(Item::Fill(k)) => k,
+                    _ => FillKind::Tint(0),
                 };
                 let style = tools::fill_style(kind, &self.assets);
-                let before = self.canvas.img.clone();
-                if paint::fill_with(&mut self.canvas.img, cx, cy, &style, self.color) {
-                    let after = std::mem::replace(&mut self.canvas.img, before);
-                    self.canvas.replace(after);
-                }
-                self.down = false;
-            }
-            ToolKind::Mixer => {
-                // Clicking the picture re-applies the selected mix.
-                if let Some(Opt::Mix(m, _)) = opt {
+                let region = crate::fills::region(&self.canvas.img, cx, cy);
+                if !region.is_empty() {
                     self.canvas.checkpoint();
-                    paint::mix_canvas(&mut self.canvas.img, m, &mut self.rng);
+                    paint::paint_region(&mut self.canvas.img, &region, &style, self.color, (fx, fy));
+                    self.play_cfg_sound(match kind {
+                        FillKind::Tint(_) => "FillSolid",
+                        FillKind::Pattern(_) => "FillPattern",
+                        FillKind::Gradient(_) => "FillGradient",
+                    });
+                    if let paint::FillStyle::Gradient(g) = style {
+                        // Holding the button and moving moves where the blend sits.
+                        self.stroke = Stroke::Blend { region, grad: g };
+                    }
                 }
-                self.down = false;
+                if !matches!(self.stroke, Stroke::Blend { .. }) {
+                    self.down = false;
+                }
             }
+            ToolKind::Mixer => match self.item(G::Options) {
+                Some(Item::MixFx(i)) => {
+                    // The Big Mixer runs once over the whole picture, centred on the click.
+                    self.canvas.checkpoint();
+                    let sz = self.tray().map(|t| t.size_idx()).unwrap_or(1) as i32 + 1;
+                    crate::mixer::apply(&mut self.canvas.img, i as usize, (cx, cy), sz, self.space, self.color, &mut self.rng);
+                    self.play_cfg_sound(crate::mixer::NAMES[i as usize]);
+                    self.down = false;
+                }
+                Some(Item::Wand(i)) => {
+                    self.canvas.checkpoint();
+                    let radius = [5.0, 10.0, 20.0][size.clamp(0.0, 2.0) as usize];
+                    let e = wand_effect(i);
+                    paint::effect_dab(&mut self.canvas.img, e, fx, fy, radius);
+                    self.stroke = Stroke::MiniMix { effect: e, radius, last: (fx, fy) };
+                    self.play_cfg_sound(WAND_NAMES[i as usize % WAND_NAMES.len()]);
+                }
+                _ => self.down = false,
+            },
             ToolKind::Stamp => {
-                match &self.stamp {
-                    Some(st) => {
-                        let s = self.stamp_scale.max(1);
-                        let img = if s == 1 { st.clone() } else { scale_nearest(st, s) };
+                let scale = match self.item(G::Size) {
+                    Some(Item::StampSize(n)) => [1, 2, 4][(n as usize).clamp(1, 3) - 1],
+                    _ => 1,
+                };
+                if let Some(Item::Stamp(id)) = self.item(G::Options) {
+                    if let Some(st) = self.stamp_image_by_id(id) {
+                        let img = if scale == 1 { st } else { scale_nearest(&st, scale) };
                         self.canvas.checkpoint();
                         gfx::blit(&mut self.canvas.img, &img, cx - img.width as i32 / 2, cy - img.height as i32 / 2);
-                        self.play_wav(EASEL, 1013, audio::CH_TOOL);
+                        self.play_cfg_sound("SimpleBitmap");
                     }
-                    None => self.open_drawer(LibKind::Stamps),
                 }
                 self.down = false;
             }
-            ToolKind::Text if matches!(opt, Some(Opt::Letter(_))) => {
-                let Some(Opt::Letter(id)) = opt else { unreachable!() };
+            ToolKind::Text if matches!(self.item(G::Options), Some(Item::Letter(_))) => {
+                let Some(Item::Letter(id)) = self.item(G::Options) else { unreachable!() };
                 if let Some(g) = tools::letter_glyph(&self.assets, id, self.color, 2.0) {
                     self.commit_text();
                     self.canvas.checkpoint();
@@ -992,28 +1487,231 @@ impl Easel {
             ToolKind::Text => {
                 self.commit_text();
                 self.canvas.checkpoint();
-                self.text = Some(TextEntry {
-                    x: cx,
-                    y: cy + (self.text_size * 0.4) as i32,
-                    base: self.canvas.img.clone(),
-                    text: String::new(),
-                });
+                self.text = Some(TextEntry { x: cx, y: cy + (self.text_size * 0.4) as i32, base: self.canvas.img.clone(), text: String::new() });
                 self.down = false;
             }
             ToolKind::Mover => {
-                let copy = matches!(opt, Some(Opt::MoverCopy));
-                if !matches!(opt, Some(Opt::MoverObjects)) {
-                    self.stroke = Stroke::MoverSelect { start: (cx, cy), cur: (cx, cy), copy };
+                if let (Some(Item::Grab(GrabTool::Scissors)), Some(Item::Cut(shape))) = (self.item(G::Variant), self.item(G::Options)) {
+                    match shape {
+                        CutShape::Polygon => {
+                            self.stroke = Stroke::CutPolygon { pts: vec![(fx, fy)], cur: (fx, fy) };
+                            self.down = false;
+                        }
+                        CutShape::Cookie(id) => {
+                            if let Some(r) = crate::regions::load(&self.assets, id) {
+                                let (x0, y0) = (cx - r.width as i32 / 2, cy - r.height as i32 / 2);
+                                self.cut_mask(x0, y0, r.width as i32, r.height as i32, |x, y| r.contains(x, y));
+                            }
+                            self.down = false;
+                        }
+                        _ => self.stroke = Stroke::Cut { shape, pts: vec![(fx, fy)], start: (fx, fy), cur: (fx, fy) },
+                    }
                 }
             }
             ToolKind::Eraser => {
-                let size = match opt {
-                    Some(Opt::Eraser(EraserKind::Square(n), _)) => n,
-                    _ => 16,
-                };
-                self.canvas.checkpoint();
-                gfx::fill_rect(&mut self.canvas.img, cx - size / 2, cy - size / 2, size, size, WHITE);
-                self.stroke = Stroke::Eraser { last: (fx, fy), size };
+                if matches!(self.item(G::Variant), Some(Item::BigEraser(true))) {
+                    if let Some(Item::BigErase(i)) = self.item(G::Options) {
+                        self.start_big_erase(i as usize, (fx, fy));
+                    }
+                    self.down = false;
+                } else {
+                    let px = [2, 10, 20][size.clamp(0.0, 2.0) as usize];
+                    let round = !matches!(self.item(G::Shape), Some(Item::EraserRound(false)));
+                    self.canvas.checkpoint();
+                    erase_dab(&mut self.canvas.img, fx, fy, px, round);
+                    self.stroke = Stroke::Eraser { last: (fx, fy), size: px, round };
+                }
+            }
+        }
+    }
+
+    /// The current Drawing Tool as a pen (Pencil line width or real-media pad).
+    fn current_pen(&self) -> Pen {
+        let size = self.tray().map(|t| t.size_idx()).unwrap_or(1) as usize;
+        let sec = match self.item(G::Variant) {
+            Some(Item::Draw(DrawTool::Chalk)) => "Chalk",
+            Some(Item::Draw(DrawTool::Crayon)) => "Crayon",
+            Some(Item::Draw(DrawTool::Marker)) => "Marker",
+            _ => return Pen::Pencil([2.0, 10.0, 20.0][size.min(2)]),
+        };
+        let p = tools::media_params(&self.assets, sec);
+        let pad = tools::pad_for(&self.pads, &p, 6.0).scaled([0.6, 1.0, 1.6][size.min(2)]);
+        Pen::Media(p, pad, self.paper.clone())
+    }
+
+    /// Draw a path (shape outline) with a pen.
+    fn stroke_path(&mut self, pts: &[(f32, f32)], pen: &Pen, closed: bool) {
+        let mut pts = pts.to_vec();
+        if closed && !pts.is_empty() {
+            pts.push(pts[0]);
+        }
+        match pen {
+            Pen::Pencil(w) => {
+                for win in pts.windows(2) {
+                    paint::line(&mut self.canvas.img, win[0].0, win[0].1, win[1].0, win[1].1, *w, self.color);
+                }
+            }
+            Pen::Media(p, pad, paper) => {
+                let mut st = MediaStroke::new(p.clone(), pad.clone(), self.rng.next_u32() as u64);
+                st.paper = paper.clone();
+                for &(x, y) in &pts {
+                    st.to(&mut self.canvas.img, x, y, self.color);
+                }
+            }
+        }
+    }
+
+    /// Scissors: lift the pixels inside a polygon into a movable piece, leaving white.
+    fn cut_out(&mut self, pts: &[(f32, f32)]) {
+        let mut inside = Vec::new();
+        paint::for_polygon_pixels(CANVAS_W as i32, CANVAS_H as i32, pts, |x, y| inside.push((x, y)));
+        if inside.len() < 4 {
+            return;
+        }
+        let set: std::collections::HashSet<(i32, i32)> = inside.into_iter().collect();
+        let (x0, y0, x1, y1) = paint::region_bbox(&set.iter().copied().collect::<Vec<_>>());
+        self.cut_mask(x0, y0, x1 - x0 + 1, y1 - y0 + 1, |x, y| set.contains(&(x + x0, y + y0)));
+    }
+
+    fn cut_mask(&mut self, x0: i32, y0: i32, w: i32, h: i32, inside: impl Fn(i32, i32) -> bool) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        self.canvas.checkpoint();
+        let mut piece = Image::new(w as u32, h as u32);
+        for y in 0..h {
+            for x in 0..w {
+                if inside(x, y) {
+                    if let Some(p) = self.canvas.img.get(x0 + x, y0 + y) {
+                        piece.put(x, y, p);
+                        self.canvas.img.put(x0 + x, y0 + y, WHITE);
+                    }
+                }
+            }
+        }
+        self.objects.push(PageObj::new(vec![piece], 1.0, x0, y0, None, None));
+        self.selected = Some(self.objects.len() - 1);
+        self.play_wav(tools::TP, 18020, audio::CH_TOOL);
+    }
+
+    fn update_spray(&mut self, dt: f32) {
+        if let Stroke::Spray { set, moving, rng, pos, acc, cel, radius } = &mut self.stroke {
+            *acc += dt / 1000.0 * 14.0;
+            while *acc >= 1.0 && !set.cels.is_empty() {
+                *acc -= 1.0;
+                let a = rng.range(0.0, std::f32::consts::TAU);
+                let d = rng.range(0.0, *radius);
+                let (x, y) = (pos.0 + a.cos() * d, pos.1 + a.sin() * d);
+                let i = *cel % set.cels.len();
+                *cel += 1 + rng.below(3) as usize;
+                if *moving {
+                    // Moving paint animates for a little while, then flattens.
+                    self.sprays.push(SprayAnim { set: set.clone(), x, y, t: 0.0, life: 1600.0 + rng.range(0.0, 900.0), phase: i });
+                } else {
+                    let c = &set.cels[i];
+                    gfx::blit(&mut self.canvas.img, c, x as i32 - c.width as i32 / 2, y as i32 - c.height as i32 / 2);
+                }
+            }
+        }
+        let mut done = Vec::new();
+        for (k, s) in self.sprays.iter_mut().enumerate() {
+            s.t += dt;
+            if s.t >= s.life {
+                done.push(k);
+            }
+        }
+        for k in done.into_iter().rev() {
+            let s = self.sprays.remove(k);
+            let c = s.current();
+            gfx::blit(&mut self.canvas.img, c, s.x as i32 - c.width as i32 / 2, s.y as i32 - c.height as i32 / 2);
+        }
+    }
+
+    /// Hands-free Sound Art: the microphone paints on its own.
+    fn update_hands_free(&mut self, dt: f32) {
+        if self.tool != ToolKind::Brush || !matches!(self.item(G::Mode), Some(Item::HandsFree(true))) {
+            return;
+        }
+        let Some(level) = self.sound_art.as_ref().map(|r| r.level()) else { return };
+        if level < 0.04 {
+            return;
+        }
+        let (mut x, mut y, mut vx, mut vy) = self.wander;
+        let k = dt / 16.0;
+        vx += self.rng.range(-0.4, 0.4) * k;
+        vy += self.rng.range(-0.4, 0.4) * k;
+        let sp = (vx * vx + vy * vy).sqrt().max(0.01);
+        let max = 1.0 + level * 6.0;
+        if sp > max {
+            vx *= max / sp;
+            vy *= max / sp;
+        }
+        x += vx * k;
+        y += vy * k;
+        if !(0.0..CANVAS_W as f32).contains(&x) {
+            vx = -vx;
+            x = x.clamp(0.0, CANVAS_W as f32 - 1.0);
+        }
+        if !(0.0..CANVAS_H as f32).contains(&y) {
+            vy = -vy;
+            y = y.clamp(0.0, CANVAS_H as f32 - 1.0);
+        }
+        self.wander = (x, y, vx, vy);
+        let hue = (self.hover_time / 20.0) % 360.0;
+        gfx::fill_circle(&mut self.canvas.img, x, y, 2.0 + level * 26.0, gfx::hsv(hue, 0.9, 1.0));
+        self.canvas.dirty = true;
+    }
+
+    /// Play a tool's start sound from its `[<Name>Snd]` section in KPD3.cfg
+    /// (the ids are tWAVs in Data/Tools/WackyBrushSounds.MHK).
+    fn play_cfg_sound(&self, name: &str) {
+        let sec = format!("{name}Snd");
+        if let Some(id) = self.assets.cfg.get_i32(&sec, "startSoundID") {
+            self.play_wav("Data/Tools/WackyBrushSounds.MHK", id as u16, audio::CH_TOOL);
+        }
+    }
+
+    fn start_big_erase(&mut self, i: usize, at: (f32, f32)) {
+        self.commit_text();
+        self.canvas.checkpoint();
+        self.play_cfg_sound(BIG_ERASERS[i.min(14)]);
+        if i == 14 {
+            // Vanish: instant.
+            self.canvas.img = Image::filled(CANVAS_W, CANVAS_H, WHITE);
+            return;
+        }
+        self.big_erase = Some(BigErase { idx: i, from: self.canvas.img.clone(), t: 0.0, at, ticks: 0, tick_acc: 0.0, extra: 0 });
+    }
+
+    fn update_big_erase(&mut self, dt: f32) {
+        let Some(be) = self.big_erase.as_mut() else { return };
+        be.t += dt;
+        if be.idx == 0 {
+            // Firecracker: every ~120 ms a white oval grows by 20 px per side around the click;
+            // once it covers the page, 7 more ticks, then the page is white.
+            be.tick_acc += dt;
+            while be.tick_acc >= 120.0 {
+                be.tick_acc -= 120.0;
+                be.ticks += 1;
+                let r = be.ticks as f32 * 20.0;
+                let (x0, y0, x1, y1) = (be.at.0 - r, be.at.1 - r, be.at.0 + r, be.at.1 + r);
+                let pts = paint::oval_points((x0, y0), (x1, y1));
+                paint::fill_polygon(&mut self.canvas.img, &pts, WHITE);
+                if x0 <= 0.0 && y0 <= 0.0 && x1 >= CANVAS_W as f32 && y1 >= CANVAS_H as f32 {
+                    be.extra += 1;
+                }
+                if be.extra >= 7 {
+                    self.canvas.img = Image::filled(CANVAS_W, CANVAS_H, WHITE);
+                    self.big_erase = None;
+                    return;
+                }
+            }
+        } else {
+            let k = (be.t / 1200.0).min(1.0);
+            let white = Image::filled(CANVAS_W, CANVAS_H, WHITE);
+            crate::slideshow::transition(BIG_ERASE_FX[be.idx], k, &be.from, &white, &mut self.canvas.img);
+            if k >= 1.0 {
+                self.big_erase = None;
             }
         }
     }
@@ -1046,7 +1744,7 @@ impl Easel {
         if ids.is_empty() {
             return;
         }
-        let sel = *self.opt_sel.get(&ToolKind::Brush).unwrap_or(&0);
+        let sel = self.tray().and_then(|t| t.group(G::Options)).map(|g| g.sel).unwrap_or(0);
         let id = ids[(sel * 7) % ids.len()];
         if !self.audio.channel_busy(audio::CH_TOOL) {
             self.play_wav("Data/Tools/WackyBrushSounds.MHK", id, audio::CH_TOOL);
@@ -1078,7 +1776,6 @@ impl Easel {
         let (fx, fy) = (cx as f32 + 0.5, cy as f32 + 0.5);
         let mut st = std::mem::replace(&mut self.stroke, Stroke::None);
         match &mut st {
-            Stroke::None => {}
             Stroke::Pencil { last, width } => {
                 paint::line(&mut self.canvas.img, last.0, last.1, fx, fy, *width, self.color);
                 *last = (fx, fy);
@@ -1088,57 +1785,84 @@ impl Easel {
                 self.wacky_apply(&mut st, (fx, fy));
                 self.play_brush_sound();
             }
-            Stroke::Eraser { last, size } => {
-                let s = *size;
+            Stroke::ShapeDrag { shape, start, cur, filled, pen, base } => {
+                *cur = (fx, fy);
+                self.canvas.img = base.clone();
+                let pts = match shape {
+                    Shape::Rect => Some(paint::rect_points(*start, *cur)),
+                    Shape::Oval => Some(paint::oval_points(*start, *cur)),
+                    _ => None,
+                };
+                let pen = pen.clone();
+                match pts {
+                    Some(p) => {
+                        if *filled {
+                            paint::fill_polygon(&mut self.canvas.img, &p, self.color);
+                        }
+                        self.stroke_path(&p, &pen, true);
+                    }
+                    None => self.stroke_path(&[*start, *cur], &pen, false),
+                }
+            }
+            Stroke::Eraser { last, size, round } => {
+                let (s, r) = (*size, *round);
                 let img = &mut self.canvas.img;
-                gfx::walk_line(last.0, last.1, fx, fy, 1.0, |px, py| {
-                    gfx::fill_rect(img, px as i32 - s / 2, py as i32 - s / 2, s, s, WHITE)
-                });
+                gfx::walk_line(last.0, last.1, fx, fy, 1.0, |px, py| erase_dab(img, px, py, s, r));
                 *last = (fx, fy);
             }
-            Stroke::MoverSelect { cur, .. } => {
-                *cur = (cx.clamp(0, CANVAS_W as i32), cy.clamp(0, CANVAS_H as i32));
+            Stroke::MiniMix { effect, radius, last } => {
+                let (e, r) = (*effect, *radius);
+                let img = &mut self.canvas.img;
+                gfx::walk_line(last.0, last.1, fx, fy, (r / 3.0).max(2.0), |px, py| paint::effect_dab(img, e, px, py, r));
+                *last = (fx, fy);
             }
+            Stroke::Blend { region, grad } => {
+                // Holding the button and moving moves the gradient's focus.
+                crate::fills::gradient_fill(&mut self.canvas.img, region, grad, (fx, fy));
+            }
+            Stroke::Spray { pos, .. } => *pos = (fx, fy),
+            Stroke::SoundArt { last, hue } => {
+                let level = self.sound_art.as_ref().map(|r| r.level()).unwrap_or(0.3);
+                let r = 2.0 + level * 30.0;
+                *hue = (*hue + 3.0 + level * 20.0) % 360.0;
+                let c = gfx::hsv(*hue, 0.9, 1.0);
+                let img = &mut self.canvas.img;
+                gfx::walk_line(last.0, last.1, fx, fy, 3.0, |px, py| gfx::fill_circle(img, px, py, r, c));
+                *last = (fx, fy);
+            }
+            Stroke::Cut { shape, pts, cur, .. } => {
+                *cur = (fx, fy);
+                if *shape == CutShape::Free {
+                    pts.push((fx, fy));
+                }
+            }
+            _ => {}
         }
         self.stroke = st;
     }
 
-    fn opt_layout(&self) -> OptLayout {
-        if self.options.len() <= OPT_PER_PAGE {
-            OptLayout { cols: OPT_PER_PAGE, rows: 1, cell: OPT_SLOT, icon: OPT_ICON as i32, y0: OPT_Y }
-        } else {
-            OptLayout { cols: 11, rows: 2, cell: 34, icon: 32, y0: OPT_Y - 6 }
-        }
-    }
-
-    /// Option index under (x, y), if any.
-    fn option_at(&self, x: i32, y: i32) -> Option<usize> {
-        let l = self.opt_layout();
-        if x < OPT_X || y < l.y0 {
-            return None;
-        }
-        let (c, r) = (((x - OPT_X) / l.cell) as usize, ((y - l.y0) / l.cell) as usize);
-        if c >= l.cols || r >= l.rows {
-            return None;
-        }
-        let i = self.opt_page * l.per_page() + r * l.cols + c;
-        (i < self.options.len()).then_some(i)
-    }
-
-    fn options_click(&mut self, x: i32, y: i32) {
-        let l = self.opt_layout();
-        let pages = self.options.len().div_ceil(l.per_page()).max(1);
-        let arrow_x = OPT_X + l.cols as i32 * l.cell + 4;
-        if pages > 1 && x >= arrow_x {
-            if y < OPT_Y + 24 {
-                self.opt_page = (self.opt_page + pages - 1) % pages;
-            } else {
-                self.opt_page = (self.opt_page + 1) % pages;
+    /// Mouse released: finish shapes, cuts and blends.
+    fn stroke_up(&mut self) {
+        match std::mem::replace(&mut self.stroke, Stroke::None) {
+            Stroke::ShapeDrag { shape: Shape::Curve, start, cur, pen, base, .. } => {
+                // First drag sets the end points; now the line bends with the mouse.
+                self.stroke = Stroke::CurveBend { a: start, b: cur, ctrl: cur, pen, base };
             }
-            return;
-        }
-        if let Some(i) = self.option_at(x, y) {
-            self.choose_option(i);
+            Stroke::Cut { shape, pts, start, cur } => {
+                let poly = match shape {
+                    CutShape::Free => pts,
+                    CutShape::Circle => paint::oval_points(start, cur),
+                    _ => paint::rect_points(start, cur),
+                };
+                self.cut_out(&poly);
+            }
+            keep @ (Stroke::Polygon { .. } | Stroke::CutPolygon { .. } | Stroke::CurveBend { .. } | Stroke::PasteAim) => self.stroke = keep,
+            other => {
+                if !matches!(other, Stroke::None) {
+                    self.canvas.dirty = true;
+                }
+                // keep multi-click strokes alive (re-stored above)
+            }
         }
     }
 
@@ -1195,36 +1919,187 @@ impl Easel {
         cols.get(r * PAL_COLS + c).copied()
     }
 
-    fn menu_item_at(&self, m: usize, x: i32, y: i32) -> Option<usize> {
-        let items = menu_items(m);
-        let mx = MENU_X[m] - 4;
-        if x < mx || x > mx + 170 || y < 18 {
-            return None;
+    /// Run an original menu command (ids from KPD3.exe's menu resource).
+    pub fn menu_command(&mut self, id: u16) {
+        use crate::menubar::cmd::*;
+        if !self.menu_state.enabled(id) {
+            return;
         }
-        let i = ((y - 20) / 20) as usize;
-        (i < items.len()).then_some(i)
+        match id {
+            NEW => self.actions.push(Action::New),
+            OPEN => self.actions.push(Action::Open),
+            SAVE_AS => self.actions.push(Action::SaveAs),
+            EXPORT => self.actions.push(Action::Export),
+            PRINT => self.actions.push(Action::Print),
+            NEW_USER => self.actions.push(Action::Login),
+            EXIT => self.actions.push(Action::Quit),
+            UNDO_REDO => self.undo_redo(),
+            CUT => self.cut(),
+            COPY => self.copy(),
+            PASTE => self.paste(),
+            ADD_GRAPHIC => self.actions.push(Action::AddGraphic),
+            ADD_MOVIE => self.actions.push(Action::AddMovie),
+            LOAD_PICTURE => self.actions.push(Action::SlideAddFile),
+            IMPORT_BACKGROUND => self.actions.push(Action::ImportBackground),
+            IMPORT_SOUND => self.actions.push(Action::ImportSound),
+            EDIT_ABC_TEXT => self.actions.push(Action::EditAbcText),
+            CHECK_SPELLING => self.actions.push(Action::CheckSpelling),
+            FLATTEN_TEXT => self.commit_text(),
+            FLATTEN_STICKERS => self.flatten_objects(),
+            SAY_IT_THIS_WAY => self.actions.push(Action::SayItThisWay),
+            IDEA_MACHINE => self.actions.push(Action::IdeaMachine),
+            TOOL_SOUNDS => self.menu_state.tool_sounds = !self.menu_state.tool_sounds,
+            TEXT_TO_SPEECH => self.menu_state.text_to_speech = !self.menu_state.text_to_speech,
+            ATTACHED_SOUND => self.menu_state.attached_sound = !self.menu_state.attached_sound,
+            MANUAL_ADVANCE => self.menu_state.manual_advance = !self.menu_state.manual_advance,
+            SMALL_KIDS => {
+                self.menu_state.small_kids = !self.menu_state.small_kids;
+                self.menubar.close();
+                self.menubar.layout(&self.fonts, self.menu_state.small_kids);
+                self.slideshow = None;
+            }
+            PROJECT_MODE => self.command(270),
+            HELP => self.command(239),
+            ABOUT => {
+                self.about = self
+                    .assets
+                    .archive("Data/About.MHK")
+                    .and_then(|a| a.ids(assets::T_SCR).first().copied())
+                    .and_then(|sid| Player::new(&self.assets, "Data/About.MHK", sid));
+            }
+            USER_GUIDE => self.actions.push(Action::UserGuide),
+            _ => {}
+        }
     }
 
-    fn menu_command(&mut self, m: usize, item: usize) {
-        match (m, item) {
-            (0, 0) => self.actions.push(Action::New),
-            (0, 1) => self.actions.push(Action::Open),
-            (0, 2) => self.actions.push(Action::Save),
-            (0, 3) => self.actions.push(Action::SaveAs),
-            (0, 4) => self.actions.push(Action::Quit),
-            (1, 0) => self.undo(),
-            (1, 1) => self.redo(),
-            (1, 2) => self.start_transition(EraserKind::ClearFade),
-            (2, 0) => self.open_drawer(LibKind::Backgrounds),
-            (2, 1) => self.open_drawer(LibKind::Stickers),
-            (2, 2) => self.open_drawer(LibKind::Toons),
-            (2, 3) => self.open_drawer(LibKind::Sounds),
-            (2, 4) => self.select_tool(ToolKind::Stamp, true),
-            _ => self.message(
-                "Kid Pix Revival: a new cross-platform engine that runs the art and sounds \
-                 from your own Kid Pix Deluxe 3 disc.",
-            ),
+    /// Dialog-based commands handled inside the easel (filled in by the dialog modules).
+    pub fn dialog_action(&mut self, a: Action) {
+        let what = match a {
+            Action::Login => "logging in as a new user",
+            Action::EditAbcText => "ABC Text",
+            Action::CheckSpelling => "spelling check",
+            Action::StampEditor => "Rubber Stamp Editor",
+            _ => "pronunciation",
+        };
+        self.message(format!("The {what} window is still being rebuilt."));
+    }
+
+    /// The Undo Guy / Edit > Undo/Redo: undo, and clicking again redoes it.
+    pub fn undo_redo(&mut self) {
+        if self.canvas.last_was_undo {
+            self.redo();
+        } else {
+            self.undo();
         }
+    }
+
+    fn cut(&mut self) {
+        if let Some(i) = self.selected.take().filter(|&i| i < self.objects.len()) {
+            self.clipboard = Some(self.objects.remove(i));
+        }
+    }
+
+    fn copy(&mut self) {
+        if let Some(o) = self.selected.and_then(|i| self.objects.get(i)) {
+            self.clipboard = Some(o.clone());
+        }
+    }
+
+    fn paste(&mut self) {
+        if let Some(mut o) = self.clipboard.clone() {
+            let (w, h) = o.size();
+            o.x = (CANVAS_W as i32 - w) / 2;
+            o.y = (CANVAS_H as i32 - h) / 2;
+            self.objects.push(o);
+            self.selected = Some(self.objects.len() - 1);
+            self.canvas.dirty = true;
+        }
+    }
+
+    /// Toolbox > Flatten Stickers and Animations: merge every object into the picture.
+    pub fn flatten_objects(&mut self) {
+        if self.objects.is_empty() {
+            return;
+        }
+        self.canvas.checkpoint();
+        let imgs: Vec<(Image, i32, i32)> = self.objects.iter().map(|o| (o.current(self.playing, self.movie_time), o.x, o.y)).collect();
+        for (im, x, y) in imgs {
+            gfx::blit(&mut self.canvas.img, &im, x, y);
+        }
+        self.objects.clear();
+        self.selected = None;
+    }
+
+    /// Start the placement-options dialog for an imported picture.
+    pub fn import_picture(&mut self, img: Image, target: FitTarget) {
+        self.overlay = Overlay::Fit(target, img, 0);
+    }
+
+    pub fn set_page_sound(&mut self, s: Arc<Sound>) {
+        self.page_sound = Some(s.clone());
+        self.audio.play(s, audio::CH_MUSIC, false);
+        self.canvas.dirty = true;
+    }
+
+    fn fit_layout() -> (i32, i32, i32, i32) {
+        (220, 170, 380, 230)
+    }
+
+    fn fit_click(&mut self, x: i32, y: i32) {
+        let (px, py, pw, ph) = Self::fit_layout();
+        let Overlay::Fit(target, img, sel) = std::mem::replace(&mut self.overlay, Overlay::None) else { return };
+        for i in 0..4 {
+            if ui::hit(x, y, px + 20, py + 50 + i * 30, pw - 40, 26) {
+                self.overlay = Overlay::Fit(target, img, i as usize);
+                return;
+            }
+        }
+        if ui::hit(x, y, px + pw - 190, py + ph - 44, 80, 30) {
+            let placed = fit_picture(&img, sel);
+            match target {
+                FitTarget::Background => self.canvas.replace(placed),
+                FitTarget::Graphic => {
+                    let obj = knock_transparent(&placed);
+                    self.objects.push(PageObj::new(vec![obj], 1.0, 0, 0, None, None));
+                    self.selected = Some(self.objects.len() - 1);
+                    self.canvas.dirty = true;
+                }
+            }
+            return;
+        }
+        if ui::hit(x, y, px + pw - 100, py + ph - 44, 80, 30) {
+            return; // cancel
+        }
+        self.overlay = Overlay::Fit(target, img, sel);
+    }
+
+    fn draw_fit(&self, frame: &mut Image, sel: usize) {
+        let (px, py, pw, ph) = Self::fit_layout();
+        ui::panel(frame, px, py, pw, ph);
+        if self.fonts.is_empty() {
+            return;
+        }
+        let f = self.menubar_face();
+        let ink = gfx::rgb(0, 0, 0);
+        self.fonts.draw(frame, f, 15.0, (px + 20) as f32, (py + 34) as f32, ink, "How should the picture be placed?");
+        for (i, label) in FIT_CHOICES.iter().enumerate() {
+            let y = py + 50 + i as i32 * 30;
+            gfx::fill_circle(frame, (px + 30) as f32, (y + 13) as f32, 7.0, ink);
+            gfx::fill_circle(frame, (px + 30) as f32, (y + 13) as f32, 5.5, WHITE);
+            if i == sel {
+                gfx::fill_circle(frame, (px + 30) as f32, (y + 13) as f32, 3.0, ink);
+            }
+            self.fonts.draw(frame, f, 14.0, (px + 46) as f32, (y + 18) as f32, ink, label);
+        }
+        for (label, bx) in [("OK", px + pw - 190), ("Cancel", px + pw - 100)] {
+            gfx::fill_round_rect(frame, bx, py + ph - 44, 80, 30, 6, gfx::rgb(200, 200, 210));
+            gfx::stroke_rect(frame, bx, py + ph - 44, 80, 30, 1, ink);
+            self.fonts.draw_centered(frame, f, 14.0, (bx + 40) as f32, (py + ph - 24) as f32, 76.0, ink, label);
+        }
+    }
+
+    fn menubar_face(&self) -> usize {
+        self.fonts.faces.iter().position(|(n, _)| n == "System").unwrap_or_else(|| self.fonts.ui_face())
     }
 
     pub fn load_picture(&mut self, img: Image) {
@@ -1240,6 +2115,21 @@ impl Easel {
 
     // ------------------------------------------------------------------ update & draw
 
+    /// A decoded QuickTime movie: the next click on the picture places it.
+    pub fn add_movie(&mut self, m: crate::movie::Movie) {
+        let poster = m.frame(0);
+        self.armed = Some((vec![poster], 1.0, None));
+        self.armed_movie = Some(Rc::new(m));
+        self.message("Click on your picture to put the movie there. Press Play to watch it.");
+    }
+
+    fn set_color(&mut self, c: u32) {
+        self.color = c;
+        if self.text.is_some() {
+            self.render_text();
+        }
+    }
+
     pub fn slideshow_add(&mut self, img: Image) {
         if let Some(ss) = self.slideshow.as_mut() {
             ss.add(img);
@@ -1251,6 +2141,24 @@ impl Easel {
         if let Some(ss) = self.slideshow.as_mut() {
             ss.update(dt);
         }
+        self.picker.update(dt, &self.assets, &self.audio, self.menu_state.tool_sounds);
+        if let Some(sh) = self.shutter.as_mut() {
+            if sh.update(dt, &self.assets, &self.audio, self.menu_state.tool_sounds) {
+                self.panel = None;
+                self.rebuild_panel();
+            }
+            if self.shutter.as_ref().is_some_and(|s| s.done()) {
+                self.shutter = None;
+            }
+        }
+        if let Some(p) = self.panel.as_mut() {
+            p.update(dt, &self.assets, &self.audio, self.menu_state.tool_sounds);
+        }
+        let sel = self.panel_selection();
+        if let Some(p) = self.panel.as_mut() {
+            p.sync(&sel);
+        }
+        self.update_big_erase(dt);
         if let Some((_, t)) = self.message.as_mut() {
             *t -= dt;
             if *t <= 0.0 {
@@ -1297,8 +2205,18 @@ impl Easel {
         if let Stroke::Media(m) = &mut self.stroke {
             m.idle(&mut self.canvas.img, self.color);
         }
+        self.update_spray(dt);
+        self.update_hands_free(dt);
         for o in self.objects.iter_mut() {
             o.t += dt / 1000.0;
+        }
+        if self.playing {
+            self.movie_time += dt / 1000.0;
+            let longest = self.objects.iter().filter_map(|o| o.movie.as_ref()).map(|m| m.duration()).fold(0.0, f32::max);
+            let has_movies = longest > 0.0;
+            if has_movies && self.movie_time > longest && self.page_sound.is_none() {
+                self.playing = false;
+            }
         }
         if let Some(tr) = self.transition.as_mut() {
             tr.t += dt;
@@ -1343,15 +2261,41 @@ impl Easel {
         // Picture + objects.
         gfx::blit(frame, &self.canvas.img, CANVAS_X, CANVAS_Y);
         let clip = (CANVAS_X, CANVAS_Y, CANVAS_X + CANVAS_W as i32, CANVAS_Y + CANVAS_H as i32);
-        for o in &self.objects {
-            gfx::blit_clip(frame, o.frame(true), CANVAS_X + o.x, CANVAS_Y + o.y, Some(clip));
+        for (i, o) in self.objects.iter().enumerate() {
+            let img = o.current(self.playing, self.movie_time);
+            gfx::blit_clip(frame, &img, CANVAS_X + o.x, CANVAS_Y + o.y, Some(clip));
+            if self.selected == Some(i) {
+                o.draw_frame(frame, CANVAS_X, CANVAS_Y, self.handles.as_deref(), self.mouse);
+            }
+        }
+        for sp in &self.sprays {
+            let c = sp.current();
+            gfx::blit_clip(frame, c, CANVAS_X + sp.x as i32 - c.width as i32 / 2, CANVAS_Y + sp.y as i32 - c.height as i32 / 2, Some(clip));
+        }
+        // Polygon / curve guides.
+        if let Stroke::CutPolygon { pts, cur } = &self.stroke {
+            for w in pts.windows(2) {
+                dashed(frame, (w[0].0 + CANVAS_X as f32, w[0].1 + CANVAS_Y as f32), (w[1].0 + CANVAS_X as f32, w[1].1 + CANVAS_Y as f32));
+            }
+            if let Some(l) = pts.last() {
+                dashed(frame, (l.0 + CANVAS_X as f32, l.1 + CANVAS_Y as f32), (cur.0 + CANVAS_X as f32, cur.1 + CANVAS_Y as f32));
+            }
+        }
+        if let Stroke::Cut { shape, pts, start, cur } = &self.stroke {
+            let poly = match shape {
+                CutShape::Free => pts.clone(),
+                CutShape::Circle => paint::oval_points(*start, *cur),
+                _ => paint::rect_points(*start, *cur),
+            };
+            for i in 0..poly.len() {
+                let (a, b) = (poly[i], poly[(i + 1) % poly.len()]);
+                if *shape == CutShape::Free && i + 1 == poly.len() {
+                    break;
+                }
+                dashed(frame, (a.0 + CANVAS_X as f32, a.1 + CANVAS_Y as f32), (b.0 + CANVAS_X as f32, b.1 + CANVAS_Y as f32));
+            }
         }
         // Selection marquee.
-        if let Stroke::MoverSelect { start, cur, .. } = &self.stroke {
-            let (x0, y0) = (start.0.min(cur.0), start.1.min(cur.1));
-            let (w, h) = ((start.0 - cur.0).abs(), (start.1 - cur.1).abs());
-            marquee(frame, CANVAS_X + x0, CANVAS_Y + y0, w, h);
-        }
         // Text caret.
         if let Some(t) = &self.text {
             let lines = t.text.split('\n').count().max(1) as f32;
@@ -1384,7 +2328,7 @@ impl Easel {
             // Current color indicator: tint the splat cel with the selected color.
             let mut tmp = Image::new(frame.width, frame.height);
             p.draw(&mut tmp);
-            let (_, r, g, b) = gfx::split(self.color);
+            let (_, r, g, b) = gfx::split(self.dropper_preview.unwrap_or(self.color));
             for (d, s) in frame.pixels.iter_mut().zip(tmp.pixels.iter()) {
                 let a = s >> 24;
                 if a == 0 {
@@ -1421,53 +2365,23 @@ impl Easel {
             p.draw(frame);
         }
 
-        self.draw_options(frame);
+        self.draw_tray(frame);
         self.draw_drawer(frame);
-        self.draw_menu_bar(frame);
 
         match &self.overlay {
-            Overlay::Palette => self.draw_palette(frame),
-            Overlay::Menu(m) => self.draw_menu(frame, *m),
+            Overlay::Palette => {}
+            Overlay::Fit(_, _, sel) => self.draw_fit(frame, *sel),
             Overlay::None => {}
         }
+        self.picker.draw(frame);
         self.draw_tooltip(frame);
         if let Some(ss) = &self.slideshow {
             ss.draw(frame, &self.fonts);
         }
-    }
-
-    fn draw_options(&self, frame: &mut Image) {
-        let l = self.opt_layout();
-        let sel = *self.opt_sel.get(&self.tool).unwrap_or(&0);
-        let start = self.opt_page * l.per_page();
-        let icons = if l.rows > 1 { &self.option_icons_small } else { &self.option_icons };
-        for (slot, i) in (start..(start + l.per_page()).min(self.options.len())).enumerate() {
-            let x = OPT_X + (slot % l.cols) as i32 * l.cell;
-            let y = l.y0 + (slot / l.cols) as i32 * l.cell;
-            let one_shot = matches!(
-                self.options[i],
-                Opt::Mix(..) | Opt::StampLibrary | Opt::Eraser(EraserKind::ClearFade | EraserKind::ClearWipe | EraserKind::ClearDissolve | EraserKind::ClearIris, _)
-            );
-            let selected = i == sel && !one_shot;
-            let hover = self.option_at(self.mouse.0, self.mouse.1) == Some(i);
-            let border = if selected {
-                gfx::rgb(230, 40, 40)
-            } else if hover {
-                gfx::rgb(40, 180, 60)
-            } else {
-                gfx::rgb(120, 130, 210)
-            };
-            gfx::fill_round_rect(frame, x - 2, y - 2, l.icon + 4, l.icon + 4, if l.rows > 1 { 5 } else { 8 }, border);
-            if let Some(icon) = icons.get(i) {
-                gfx::blit(frame, icon, x, y);
-            }
+        if let Some(p) = &self.about {
+            p.draw(frame);
         }
-        let pages = self.options.len().div_ceil(l.per_page());
-        if pages > 1 {
-            let ax = OPT_X + l.cols as i32 * l.cell + 4;
-            ui::arrow_button(frame, ax, OPT_Y - 2, 22, -1, true, true);
-            ui::arrow_button(frame, ax, OPT_Y + 28, 22, 1, true, true);
-        }
+        self.menubar.draw(frame, &self.fonts, &self.menu_state);
     }
 
     fn draw_drawer(&self, frame: &mut Image) {
@@ -1521,40 +2435,6 @@ impl Easel {
         }
     }
 
-    fn draw_menu_bar(&self, frame: &mut Image) {
-        if self.fonts.is_empty() {
-            return;
-        }
-        let f = self.fonts.ui_face();
-        for (i, t) in MENU_TITLES.iter().enumerate() {
-            let open = matches!(self.overlay, Overlay::Menu(m) if m == i);
-            if open {
-                gfx::fill_rect(frame, MENU_X[i] - 4, 0, self.fonts.measure(f, 14.0, t) as i32 + 8, 18, gfx::rgb(70, 90, 220));
-            }
-            self.fonts.draw(frame, f, 14.0, MENU_X[i] as f32, 14.0, gfx::rgb(255, 255, 255), t);
-        }
-    }
-
-    fn draw_menu(&self, frame: &mut Image, m: usize) {
-        let items = menu_items(m);
-        let x = MENU_X[m] - 4;
-        let h = items.len() as i32 * 20 + 6;
-        gfx::fill_rect(frame, x + 3, 21, 170, h, gfx::argb(80, 0, 0, 0));
-        gfx::fill_rect(frame, x, 18, 170, h, gfx::rgb(250, 250, 255));
-        gfx::stroke_rect(frame, x, 18, 170, h, 1, gfx::rgb(40, 50, 170));
-        if self.fonts.is_empty() {
-            return;
-        }
-        let f = self.fonts.ui_face();
-        for (i, t) in items.iter().enumerate() {
-            let y = 20 + i as i32 * 20;
-            if ui::hit(self.mouse.0, self.mouse.1, x, y, 170, 20) {
-                gfx::fill_rect(frame, x + 1, y, 168, 20, gfx::rgb(200, 210, 255));
-            }
-            self.fonts.draw(frame, f, 14.0, (x + 8) as f32, (y + 15) as f32, gfx::rgb(0, 0, 0), t);
-        }
-    }
-
     fn draw_palette(&self, frame: &mut Image) {
         let cols = ui::palette_colors();
         let rows = cols.len().div_ceil(PAL_COLS) as i32;
@@ -1588,24 +2468,6 @@ impl Easel {
             self.wrap_bubble(frame, m);
             return;
         }
-        if self.hover_time < 700.0 {
-            return;
-        }
-        let (mx, my) = self.mouse;
-        let label = if let Some(i) = self.hover_btn {
-            command_name(self.buttons[i].cmd).to_string()
-        } else if let Some(i) = self.option_at(mx, my) {
-            self.options.get(i).map(|o| o.label()).unwrap_or_default()
-        } else if ui::hit(mx, my, COLOR_RECT.0, COLOR_RECT.1, COLOR_RECT.2, COLOR_RECT.3) {
-            "Colors".into()
-        } else if ui::hit(mx, my, FACE_RECT.0, FACE_RECT.1, FACE_RECT.2, FACE_RECT.3) {
-            "Undo".into()
-        } else {
-            String::new()
-        };
-        if !label.is_empty() {
-            self.bubble(frame, mx, (my - 34).max(20), &label);
-        }
     }
 
     fn wrap_bubble(&self, frame: &mut Image, text: &str) {
@@ -1638,6 +2500,15 @@ impl Easel {
     /// Cursor for the current state. `Cur(n)` = cursor n of `General.MHK` (tCUR 10000+n).
     pub fn cursor_hint(&self) -> CursorHint {
         let (x, y) = self.mouse;
+        if self.menubar.hot(y) && !self.menubar.shown {
+            return CursorHint::Drop;
+        }
+        if self.menubar.shown {
+            return CursorHint::Cur(28);
+        }
+        if self.picker.eyedropper {
+            return CursorHint::Cur(6);
+        }
         if self.slideshow.is_some() {
             return CursorHint::Cur(28);
         }
@@ -1653,14 +2524,16 @@ impl Easel {
         if self.armed.is_some() {
             return CursorHint::Cur(11);
         }
-        let opt = self.current_opt();
         CursorHint::Cur(match self.tool {
-            ToolKind::Pencil => match opt {
-                Some(Opt::Media("Marker", _)) => 2,
-                Some(Opt::Media("Airbrush", _)) => 6,
-                Some(Opt::Media(..)) => 0,
+            ToolKind::Pencil => match self.item(G::Variant) {
+                Some(Item::Draw(DrawTool::Marker)) => 2,
+                Some(Item::Draw(DrawTool::Chalk | DrawTool::Crayon)) => 0,
                 _ => 1,
             },
+            ToolKind::Brush if matches!(self.item(G::Variant), Some(Item::Paint(PaintTool::SoundArt))) => 21,
+            ToolKind::Brush if matches!(self.item(G::Variant), Some(Item::Paint(PaintTool::Spray))) => 6,
+            ToolKind::Mover if matches!(self.item(G::Variant), Some(Item::Grab(GrabTool::Scissors))) => 13,
+            ToolKind::Eraser if matches!(self.item(G::Variant), Some(Item::BigEraser(true))) => 4,
             ToolKind::Brush => 15,
             ToolKind::Fill => 17,
             ToolKind::Mixer => 12,
@@ -1678,24 +2551,12 @@ impl Easel {
     }
 }
 
-struct OptLayout {
-    cols: usize,
-    rows: usize,
-    cell: i32,
-    icon: i32,
-    y0: i32,
-}
-
-impl OptLayout {
-    fn per_page(&self) -> usize {
-        self.cols * self.rows
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CursorHint {
     /// Cursor index into `Data/General.MHK` (tCUR id 10000 + n).
     Cur(u16),
+    /// The white-outlined triangle that reveals the menu bar.
+    Drop,
 }
 
 fn marquee(frame: &mut Image, x: i32, y: i32, w: i32, h: i32) {
@@ -1722,6 +2583,22 @@ fn scale_nearest(src: &Image, s: u32) -> Image {
 }
 
 impl Easel {
+    /// Self-test: screen position of tray item `idx` of group `g` (pages the options list).
+    pub fn test_tray_pos(&mut self, g: G, idx: usize) -> Option<(i32, i32)> {
+        let gi = self.tray()?.groups.iter().position(|x| x.kind == g)?;
+        if g == G::Options {
+            let per = self.options_per_page();
+            if let Some(grp) = self.trays.get_mut(&self.tool).and_then(|t| t.groups.get_mut(gi)) {
+                grp.page = idx / per;
+            }
+        }
+        self.tray_layout().into_iter().find(|e| e.0 == gi && e.1 == idx).map(|e| (e.2 + e.4 / 2, e.3 + e.4 / 2))
+    }
+
+    pub fn tool_button(&self, cmd: u16) -> Option<(i32, i32)> {
+        self.buttons.iter().find(|b| b.cmd == cmd).map(|b| ((b.rect.left as i32 + b.rect.right as i32) / 2, (b.rect.top as i32 + b.rect.bottom as i32) / 2))
+    }
+
     /// Used by the headless self-test: blank page with a colored frame.
     pub fn new_picture_for_test(&mut self) {
         let ss = self.slideshow.take();
@@ -1730,4 +2607,116 @@ impl Easel {
         gfx::fill_circle(&mut self.canvas.img, 300.0, 226.0, 120.0, gfx::rgb(40, 120, 230));
         self.slideshow = ss;
     }
+}
+
+/// Apply one of the four import placement options to a picture for the 600x452 page.
+pub fn fit_picture(img: &Image, mode: usize) -> Image {
+    let (cw, ch) = (CANVAS_W, CANVAS_H);
+    match mode {
+        0 => gfx::resize(img, cw, ch),
+        1 => {
+            let s = (cw as f32 / img.width as f32).min(ch as f32 / img.height as f32);
+            let r = gfx::resize(img, (img.width as f32 * s) as u32, (img.height as f32 * s) as u32);
+            let mut out = Image::filled(cw, ch, WHITE);
+            gfx::blit(&mut out, &r, (cw as i32 - r.width as i32) / 2, (ch as i32 - r.height as i32) / 2);
+            out
+        }
+        2 => {
+            let mut out = Image::filled(cw, ch, WHITE);
+            gfx::blit(&mut out, img, (cw as i32 - img.width as i32) / 2, (ch as i32 - img.height as i32) / 2);
+            out
+        }
+        _ => {
+            // Repeat many small copies (tiles about a quarter of the page wide).
+            let s = (150.0 / img.width as f32).min(113.0 / img.height as f32).min(1.0);
+            let t = gfx::resize(img, ((img.width as f32 * s) as u32).max(1), ((img.height as f32 * s) as u32).max(1));
+            let mut out = Image::filled(cw, ch, WHITE);
+            for y in (0..ch as i32).step_by(t.height as usize) {
+                for x in (0..cw as i32).step_by(t.width as usize) {
+                    gfx::blit(&mut out, &t, x, y);
+                }
+            }
+            out
+        }
+    }
+}
+
+fn knock_transparent(img: &Image) -> Image {
+    img.clone()
+}
+
+fn erase_dab(img: &mut Image, x: f32, y: f32, size: i32, round: bool) {
+    if round {
+        gfx::fill_circle(img, x, y, size as f32 / 2.0, WHITE);
+    } else {
+        gfx::fill_rect(img, x as i32 - size / 2, y as i32 - size / 2, size, size, WHITE);
+    }
+}
+
+fn dashed(frame: &mut Image, a: (f32, f32), b: (f32, f32)) {
+    let mut k = 0;
+    gfx::walk_line(a.0, a.1, b.0, b.1, 1.0, |x, y| {
+        frame.put(x as i32, y as i32, if (k / 4) % 2 == 0 { 0xff00_0000 } else { WHITE });
+        k += 1;
+    });
+}
+
+/// A blob of moving paint (Spray Can, Moving Paint mode) before it flattens.
+pub struct SprayAnim {
+    set: Rc<SpriteSet>,
+    x: f32,
+    y: f32,
+    t: f32,
+    life: f32,
+    phase: usize,
+}
+
+impl SprayAnim {
+    fn current(&self) -> &Image {
+        let n = self.set.cels.len().max(1);
+        &self.set.cels[(self.phase + (self.t / 90.0) as usize) % n]
+    }
+}
+
+/// Big erasers (tool ids 123..137) in panel order; names = KPD3.cfg sound sections.
+const BIG_ERASERS: [&str; 15] = [
+    "Firecracker", "ClockFace", "IrisHeart", "IrisStar", "Windmill", "PageTear", "Spiral", "Implode", "Engulf", "Fade", "Explode",
+    "Kaleidoscope", "Waterfall", "WipeRight", "Vanish",
+];
+/// The QuickTime-effect erasers, as the matching wipe of the engine's transition set.
+const BIG_ERASE_FX: [usize; 15] = [0, 1, 7, 9, 23, 14, 20, 5, 2, 4, 3, 11, 22, 27, 0];
+
+/// Mixer Wand brushes (tool ids 87..98).
+const WAND_NAMES: [&str; 12] = [
+    "SmearBrush", "BlurBrush", "GreyscaleBrush", "ColorizeBrush", "XRayBrush", "EmbossBrush", "EdgeBrush", "NuclearBrush", "SolarizeBrush",
+    "HueShiftBrush", "PosterizeBrush", "MosaicBrush",
+];
+
+fn wand_effect(i: u8) -> paint::Effect {
+    use paint::Effect::*;
+    [Blur, Blur, Greyscale, HueShift, Invert, Emboss, Edge, HueShift, Solarize, HueShift, Posterize, Mosaic][i as usize % 12]
+}
+
+fn pencil_shape_cmd(shape: Option<Shape>, filled: bool) -> u16 {
+    match (shape, filled) {
+        (Some(Shape::Line), _) => 18450,
+        (Some(Shape::Curve), _) => 18451,
+        (Some(Shape::Rect), false) => 18452,
+        (Some(Shape::Rect), true) => 18453,
+        (Some(Shape::Oval), false) => 18454,
+        (Some(Shape::Oval), true) => 18455,
+        (Some(Shape::Polygon), false) => 18456,
+        (Some(Shape::Polygon), true) => 18457,
+        _ => 18458,
+    }
+}
+
+struct BigErase {
+    idx: usize,
+    from: Image,
+    t: f32,
+    at: (f32, f32),
+    ticks: u32,
+    tick_acc: f32,
+    extra: u32,
 }

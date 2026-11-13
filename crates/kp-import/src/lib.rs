@@ -99,7 +99,7 @@ pub fn wanted(rel: &str) -> bool {
         "data" => !l.starts_with("data/players/"),
         "libraries" | "idea machine" | "qtmovies" => true,
         "install" => l.starts_with("install/fonts/"),
-        "kpinstall" => l.ends_with(".cfg") || l.ends_with(".ini") || l.ends_with(".lex") || l.ends_with(".env"),
+        "kpinstall" => l.ends_with(".cfg") || l.ends_with(".ini") || l.ends_with(".lex") || l.ends_with(".env") || l.ends_with(".pdf"),
         _ => l == "read me.txt",
     }
 }

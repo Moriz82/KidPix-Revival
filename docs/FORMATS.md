@@ -48,7 +48,7 @@ file table (D + file table offset):
 | Tag    | Meaning |
 |--------|---------|
 | `tBMP` | single bitmap (see *Bitmaps*) |
-| `tBMH` | bitmap set: `u16 count, u16 ?, u16 ?, u16 setFormat, count x u32 offset`; each entry is a bitmap. If `setFormat & 0xf00 == 0x100` everything after the 8-byte header is LZ-packed and the offsets are relative to (header + unpacked data). `0x400` (two sets, unknown compressor) is not decoded. |
+| `tBMH` | bitmap set: `u16 count, u16 ?, u16 ?, u16 setFormat, count x u32 offset`; each entry is a bitmap. If `setFormat & 0xf00 == 0x100` everything after the 8-byte header is LZ-packed and the offsets are relative to (header + unpacked data). The original program only accepts packing 0x000, 0x100, 0x200 (LZ with a 14-byte header) and 0xf00 (plug-in codecs such as JPEG); anything else — including the `0x400` sets in the 1999 `MainTools.MHK` and `Icons.MHK` 2350 — makes it return error 0x2a63, so those two sets are unused leftovers. |
 | `tPAL` | palette: `u16 first, u16 count, count x {r,g,b,pad}` |
 | `tCNT` | `u16 baseId, u16 count` (e.g. 1000/238: the tBMH 1000 has 237 cels, REGS have 238 entries) |
 | `REGS` | registration points. Two REGS per tBMH: `REGS id` = x array, `REGS id+1` = y array; `i16` per cel, index = cel number (1-based, entry 0 unused) |
@@ -104,7 +104,8 @@ Rows may be missing at the end of the data (treat as transparent).
 ### LZ (`pack = 0x100`)
 
 Mohawk LZSS, same as ScummVM's `MohawkBitmap::unpackLZ`: header `u32 uncompressed,
-u32 compressed, u16 dictSize (0x400)`; flag byte LSB-first, `1` = literal byte,
+u32 compressed, u16 dictSize` (0x100..0x1000 select 8..12 position bits; pack 0x200 adds 4
+more header bytes); flag byte LSB-first, `1` = literal byte,
 `0` = `u16 offLen`: `len = (offLen >> 10) + 3`, `pos = (offLen + 66) & 0x3ff`,
 copy from `out[-((insertPos - pos) & 0x3ff)]`.
 

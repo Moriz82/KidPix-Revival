@@ -189,6 +189,7 @@ pub fn decode_bitmap(data: &[u8], palette: Option<&Palette>) -> Result<Image> {
             Ok(decode_indexed(data)?.to_image(pal))
         }
         3 => decode_16(data, &h),
+        4 => decode_32(data, &h),
         _ => Err(Error::Unsupported(format!("bitmap format {:#06x}", h.format))),
     }
 }
@@ -212,6 +213,11 @@ pub fn decode_indexed(data: &[u8]) -> Result<Indexed> {
             unpacked = unpack_lz(&data[8..])?;
             &unpacked
         }
+        0x200 => {
+            unpacked = unpack_lz_with_header(&data[8..], 14)?;
+            &unpacked
+        }
+        // The original program refuses any other packing too (error 0x2a63).
         p => return Err(Error::Unsupported(format!("pack {p:#x}"))),
     };
     let (w, ht) = (h.width as usize, h.height as usize);
@@ -262,6 +268,11 @@ fn decode_16(data: &[u8], h: &BitmapHeader) -> Result<Image> {
             unpacked = unpack_lz(&data[8..])?;
             &unpacked
         }
+        0x200 => {
+            unpacked = unpack_lz_with_header(&data[8..], 14)?;
+            &unpacked
+        }
+        // The original program refuses any other packing too (error 0x2a63).
         p => return Err(Error::Unsupported(format!("pack {p:#x}"))),
     };
     let (w, ht) = (h.width as usize, h.height as usize);
@@ -279,6 +290,76 @@ fn decode_16(data: &[u8], h: &BitmapHeader) -> Result<Image> {
         }
         0x30 => decode_sprite_rle16(body, &mut img)?,
         d => return Err(Error::Unsupported(format!("16-bit draw mode {d:#x}"))),
+    }
+    Ok(img)
+}
+
+fn decode_32(data: &[u8], h: &BitmapHeader) -> Result<Image> {
+    let unpacked;
+    let body: &[u8] = match h.pack() {
+        0 => &data[8..],
+        0x100 => {
+            unpacked = unpack_lz(&data[8..])?;
+            &unpacked
+        }
+        0x200 => {
+            unpacked = unpack_lz_with_header(&data[8..], 14)?;
+            &unpacked
+        }
+        // The original program refuses any other packing too (error 0x2a63).
+        p => return Err(Error::Unsupported(format!("pack {p:#x}"))),
+    };
+    let (w, ht) = (h.width as usize, h.height as usize);
+    let mut img = Image::new(w as u32, ht as u32);
+    let px = |b: &[u8]| 0xff00_0000 | (u32::from_be_bytes([b[0], b[1], b[2], b[3]]) & 0x00ff_ffff);
+    match h.draw() {
+        0 => {
+            let bpr = h.bytes_per_row as usize;
+            for y in 0..ht {
+                for x in 0..w {
+                    let o = y * bpr + x * 4;
+                    let Some(b) = body.get(o..o + 4) else { break };
+                    img.pixels[y * w + x] = px(b);
+                }
+            }
+        }
+        0x30 => {
+            // Same row/command layout as the 16-bit sprite RLE, with 32-bit XRGB pixels;
+            // a run carries a single pixel.
+            let mut r = Reader::new(body);
+            for y in 0..ht {
+                if r.remaining() < 4 {
+                    break;
+                }
+                let dwords = r.u16()? as usize;
+                let mut x = r.u16()? as usize;
+                let end = r.pos + dwords * 4;
+                let row = &mut img.pixels[y * w..y * w + w];
+                while r.pos + 4 <= end {
+                    let cmd = r.u16()?;
+                    let skip = r.u16()? as usize;
+                    let count = (cmd & 0x7fff) as usize;
+                    if cmd & 0x8000 != 0 {
+                        let v = px(r.bytes(4)?);
+                        for i in 0..count {
+                            if let Some(p) = row.get_mut(x + i) {
+                                *p = v;
+                            }
+                        }
+                    } else {
+                        let b = r.bytes(count * 4)?;
+                        for i in 0..count {
+                            if let Some(p) = row.get_mut(x + i) {
+                                *p = px(&b[4 * i..4 * i + 4]);
+                            }
+                        }
+                    }
+                    x += count + skip;
+                }
+                r.pos = end;
+            }
+        }
+        d => return Err(Error::Unsupported(format!("32-bit draw mode {d:#x}"))),
     }
     Ok(img)
 }
@@ -374,9 +455,10 @@ pub fn decode_bitmap_set(data: &[u8], palette: Option<&Palette>) -> Result<Vec<I
     let unpacked;
     let data: &[u8] = match set_format & 0xf00 {
         0 => data,
-        0x100 => {
+        0x100 | 0x200 => {
             let mut v = data[..8].to_vec();
-            v.extend_from_slice(&unpack_lz(&data[8..])?);
+            let hl = if set_format & 0xf00 == 0x100 { 10 } else { 14 };
+            v.extend_from_slice(&unpack_lz_with_header(&data[8..], hl)?);
             unpacked = v;
             &unpacked
         }
@@ -394,24 +476,46 @@ pub fn decode_bitmap_set(data: &[u8], palette: Option<&Palette>) -> Result<Vec<I
         let Some(slice) = data.get(a..b.min(data.len())) else {
             return bad(format!("tBMH member {i} out of range"));
         };
-        out.push(decode_bitmap(slice, palette)?);
+        let h = BitmapHeader::parse(slice)?;
+        let mut img = decode_bitmap(slice, palette)?;
+        if h.bpp_code() == 2 && palette.is_none() {
+            // 8-bit members without a palette are soft drop-shadow alpha maps
+            // (0 = transparent, n = coverage n/255), drawn as black.
+            for p in img.pixels.iter_mut() {
+                *p = (*p & 0xff) << 24;
+            }
+        }
+        out.push(img);
     }
     Ok(out)
 }
 
 /// Mohawk LZSS decompression (header: u32 uncompressed, u32 compressed, u16 dict size).
+/// The dictionary size selects the window (0x100..0x1000 → 8..12 position bits), as in the
+/// original program.
 pub fn unpack_lz(data: &[u8]) -> Result<Vec<u8>> {
-    const POS_BITS: u32 = 10;
+    unpack_lz_with_header(data, 10)
+}
+
+/// `header_len` is 10 for pack type 0x100 and 14 for 0x200.
+pub fn unpack_lz_with_header(data: &[u8], header_len: usize) -> Result<Vec<u8>> {
     const MIN_STRING: usize = 3;
-    const MAX_STRING: usize = (1 << 6) + MIN_STRING - 1;
-    const MASK: usize = (1 << POS_BITS) - 1;
     let mut r = Reader::new(data);
     let usize_ = r.u32()? as usize;
     let _csize = r.u32()?;
     let dict = r.u16()?;
-    if dict != 0x400 {
-        return Err(Error::Unsupported(format!("LZ dictionary size {dict:#x}")));
-    }
+    let pos_bits: u32 = match dict {
+        0x100 => 8,
+        0x200 => 9,
+        0x400 => 10,
+        0x800 => 11,
+        0x1000 => 12,
+        _ => return Err(Error::Unsupported(format!("LZ dictionary size {dict:#x}"))),
+    };
+    r.pos = header_len;
+    let mask: usize = (1 << pos_bits) - 1;
+    // Longest match = (1 << (16 - pos_bits)) + 2; the window starts that far before its end.
+    let max_string: usize = (1 << (16 - pos_bits)) + MIN_STRING - 1;
     if usize_ > 64 << 20 {
         return bad("LZ output too large");
     }
@@ -425,19 +529,19 @@ pub fn unpack_lz(data: &[u8]) -> Result<Vec<u8>> {
         }
         if flags & 1 != 0 {
             out.push(r.u8()?);
-            insert = (insert + 1) & MASK;
+            insert = (insert + 1) & mask;
         } else {
             let off_len = r.u16()? as usize;
-            let len = (off_len >> POS_BITS) + MIN_STRING;
-            let pos = (off_len + MAX_STRING) & MASK;
-            let back = (insert.wrapping_sub(pos)) & MASK;
+            let len = (off_len >> pos_bits) + MIN_STRING;
+            let pos = (off_len + max_string) & mask;
+            let back = (insert.wrapping_sub(pos)) & mask;
             let start = out.len() as isize - back as isize;
             for i in 0..len {
                 let idx = start + i as isize;
                 let v = if idx >= 0 { out[idx as usize] } else { 0 };
                 out.push(v);
             }
-            insert = (insert + len) & MASK;
+            insert = (insert + len) & mask;
         }
     }
     out.truncate(usize_);

@@ -15,6 +15,8 @@ pub struct Canvas {
     undo: Vec<Image>,
     redo: Vec<Image>,
     pub dirty: bool,
+    /// The last history step was an undo (so the Undo Guy redoes next).
+    pub last_was_undo: bool,
 }
 
 impl Canvas {
@@ -24,6 +26,7 @@ impl Canvas {
             undo: Vec::new(),
             redo: Vec::new(),
             dirty: false,
+            last_was_undo: false,
         }
     }
 
@@ -35,12 +38,14 @@ impl Canvas {
         }
         self.redo.clear();
         self.dirty = true;
+        self.last_was_undo = false;
     }
 
     pub fn undo(&mut self) -> bool {
         if let Some(prev) = self.undo.pop() {
             let cur = std::mem::replace(&mut self.img, prev);
             self.redo.push(cur);
+            self.last_was_undo = true;
             true
         } else {
             false
@@ -51,6 +56,7 @@ impl Canvas {
         if let Some(next) = self.redo.pop() {
             let cur = std::mem::replace(&mut self.img, next);
             self.undo.push(cur);
+            self.last_was_undo = false;
             true
         } else {
             false
@@ -226,6 +232,12 @@ impl MediaParams {
 
 /// Stamp one pad of `color` centred at (cx, cy) with opacity `alpha` (0..1).
 pub fn dab(dst: &mut Image, pad: &Pad, cx: f32, cy: f32, color: u32, alpha: f32, rng: Option<(&mut Rng, i32)>) {
+    dab_on(dst, pad, cx, cy, color, alpha, rng, None)
+}
+
+/// Like [`dab`], with the page's paper texture showing through (Crayon, Chalk, Marker).
+#[allow(clippy::too_many_arguments)]
+pub fn dab_on(dst: &mut Image, pad: &Pad, cx: f32, cy: f32, color: u32, alpha: f32, rng: Option<(&mut Rng, i32)>, paper: Option<&Image>) {
     let x0 = (cx - pad.w as f32 / 2.0).round() as i32;
     let y0 = (cy - pad.h as f32 / 2.0).round() as i32;
     let (_, cr, cg, cb) = split(color);
@@ -241,7 +253,14 @@ pub fn dab(dst: &mut Image, pad: &Pad, cx: f32, cy: f32, color: u32, alpha: f32,
                     continue;
                 }
             }
-            let a = (m as f32 * alpha).clamp(0.0, 255.0) as u8;
+            let grain = match paper {
+                Some(p) => {
+                    let l = p.get(x0 + x, y0 + y).map(|v| v & 0xff).unwrap_or(255) as f32;
+                    0.2 + 0.8 * l / 255.0
+                }
+                None => 1.0,
+            };
+            let a = (m as f32 * alpha * grain).clamp(0.0, 255.0) as u8;
             if a == 0 {
                 continue;
             }
@@ -266,6 +285,8 @@ pub struct MediaStroke {
     pub last: Option<(f32, f32)>,
     pub travelled: f32,
     pub rng: Rng,
+    /// Paper texture of the page (shows through Crayon/Chalk/Marker).
+    pub paper: Option<std::rc::Rc<Image>>,
 }
 
 impl MediaStroke {
@@ -276,6 +297,7 @@ impl MediaStroke {
             last: None,
             travelled: 0.0,
             rng: Rng::new(seed),
+            paper: None,
         }
     }
 
@@ -311,7 +333,8 @@ impl MediaStroke {
             dab(dst, &self.pad, x + so, y + so, shade, sa, None);
         }
         let spatter = self.params.spatter;
-        dab(dst, &self.pad, x, y, color, a, Some((&mut self.rng, spatter)));
+        let paper = self.paper.clone();
+        dab_on(dst, &self.pad, x, y, color, a, Some((&mut self.rng, spatter)), paper.as_deref());
         if self.params.glint_offset != 0 {
             let go = self.params.glint_offset as f32;
             let ga = a / (1.0 + self.params.glint_bias.max(0) as f32 * 0.4);
@@ -661,8 +684,10 @@ pub enum FillStyle {
     Stretch(Image),
     /// Picture repeated (the CD's pattern fills).
     Tile(Image),
-    /// Greyscale texture shaded with the current color.
-    Tint(Image),
+    /// Greyscale texture shaded with the current color (TP 20500+i).
+    Tint(mohawk::Indexed),
+    /// A `grad` gradient fitted to the region.
+    Gradient(crate::fills::Grad),
 }
 
 fn sample_bilinear(img: &Image, fx: f32, fy: f32) -> u32 {
@@ -679,43 +704,103 @@ fn sample_bilinear(img: &Image, fx: f32, fy: f32) -> u32 {
 }
 
 pub fn fill_with(img: &mut Image, x: i32, y: i32, style: &FillStyle, color: u32) -> bool {
-    let region = flood_region(img, x, y, 24);
-    if region.is_empty() {
-        return false;
+    let region = crate::fills::region(img, x, y);
+    paint_region(img, &region, style, color, (x as f32, y as f32));
+    !region.is_empty()
+}
+
+// ---------------------------------------------------------------------------------------
+// Shapes (Drawing Tools) and cut-outs (Scissors).
+
+/// Even-odd scanline fill of a polygon.
+pub fn fill_polygon(img: &mut Image, pts: &[(f32, f32)], color: u32) {
+    for_polygon_pixels(img.width as i32, img.height as i32, pts, |x, y| img.put(x, y, color));
+}
+
+/// Call `f` for every pixel inside the polygon (even-odd rule), clipped to w x h.
+pub fn for_polygon_pixels(w: i32, h: i32, pts: &[(f32, f32)], mut f: impl FnMut(i32, i32)) {
+    if pts.len() < 3 {
+        return;
     }
+    let y0 = pts.iter().map(|p| p.1).fold(f32::MAX, f32::min).floor().max(0.0) as i32;
+    let y1 = pts.iter().map(|p| p.1).fold(f32::MIN, f32::max).ceil().min(h as f32 - 1.0) as i32;
+    let mut xs = Vec::new();
+    for y in y0..=y1 {
+        let sy = y as f32 + 0.5;
+        xs.clear();
+        for i in 0..pts.len() {
+            let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+            if (a.1 <= sy && b.1 > sy) || (b.1 <= sy && a.1 > sy) {
+                xs.push(a.0 + (sy - a.1) / (b.1 - a.1) * (b.0 - a.0));
+            }
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for pair in xs.chunks_exact(2) {
+            let xa = pair[0].round().max(0.0) as i32;
+            let xb = (pair[1].round() as i32).min(w);
+            for x in xa..xb {
+                f(x, y);
+            }
+        }
+    }
+}
+
+pub fn rect_points(a: (f32, f32), b: (f32, f32)) -> Vec<(f32, f32)> {
+    vec![(a.0, a.1), (b.0, a.1), (b.0, b.1), (a.0, b.1)]
+}
+
+pub fn oval_points(a: (f32, f32), b: (f32, f32)) -> Vec<(f32, f32)> {
+    let (cx, cy) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+    let (rx, ry) = (((b.0 - a.0) / 2.0).abs(), ((b.1 - a.1) / 2.0).abs());
+    let n = ((rx + ry) * 0.8).clamp(16.0, 160.0) as usize;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / n as f32 * std::f32::consts::TAU;
+            (cx + t.cos() * rx, cy + t.sin() * ry)
+        })
+        .collect()
+}
+
+/// Quadratic Bézier from a to b bent towards control point c.
+pub fn curve_points(a: (f32, f32), c: (f32, f32), b: (f32, f32)) -> Vec<(f32, f32)> {
+    let n = 48;
+    (0..=n)
+        .map(|i| {
+            let t = i as f32 / n as f32;
+            let u = 1.0 - t;
+            (u * u * a.0 + 2.0 * u * t * c.0 + t * t * b.0, u * u * a.1 + 2.0 * u * t * c.1 + t * t * b.1)
+        })
+        .collect()
+}
+
+pub fn region_bbox(region: &[(i32, i32)]) -> (i32, i32, i32, i32) {
+    let mut b = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for &(x, y) in region {
+        b = (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y));
+    }
+    b
+}
+
+/// Paint a fill region with a style; `focus` is the radial gradient's focus (click point).
+pub fn paint_region(img: &mut Image, region: &[(i32, i32)], style: &FillStyle, color: u32, focus: (f32, f32)) {
     let w = img.width as i32;
-    let (mut bx0, mut by0, mut bx1, mut by1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
-    for &(px, py) in &region {
-        bx0 = bx0.min(px);
-        by0 = by0.min(py);
-        bx1 = bx1.max(px);
-        by1 = by1.max(py);
-    }
-    let bw = (bx1 - bx0 + 1) as f32;
-    let bh = (by1 - by0 + 1) as f32;
-    for &(px, py) in &region {
-        let c = match style {
-            FillStyle::Solid => color,
-            FillStyle::Stretch(src) => {
+    match style {
+        FillStyle::Solid => {
+            for &(x, y) in region {
+                img.pixels[(y * w + x) as usize] = color;
+            }
+        }
+        FillStyle::Tint(t) => crate::fills::tint(img, region, t, color),
+        FillStyle::Tile(pat) => crate::fills::pattern(img, region, pat),
+        FillStyle::Gradient(g) => crate::fills::gradient_fill(img, region, g, focus),
+        FillStyle::Stretch(src) => {
+            let (bx0, by0, bx1, by1) = region_bbox(region);
+            let (bw, bh) = ((bx1 - bx0 + 1) as f32, (by1 - by0 + 1) as f32);
+            for &(px, py) in region {
                 let fx = (px - bx0) as f32 / bw * src.width as f32 - 0.5;
                 let fy = (py - by0) as f32 / bh * src.height as f32 - 0.5;
-                sample_bilinear(src, fx, fy)
+                img.pixels[(py * w + px) as usize] = sample_bilinear(src, fx, fy);
             }
-            FillStyle::Tile(src) => {
-                let (tw, th) = (src.width.max(1) as i32, src.height.max(1) as i32);
-                src.pixels[(py.rem_euclid(th) * tw + px.rem_euclid(tw)) as usize] | 0xff00_0000
-            }
-            FillStyle::Tint(src) => {
-                let (tw, th) = (src.width.max(1) as i32, src.height.max(1) as i32);
-                let l = luma(src.pixels[(py.rem_euclid(th) * tw + px.rem_euclid(tw)) as usize]);
-                if l < 128 {
-                    lerp(BLACK, color, l * 2)
-                } else {
-                    lerp(color, WHITE, (l - 128) * 2)
-                }
-            }
-        };
-        img.pixels[(py * w + px) as usize] = c;
+        }
     }
-    true
 }

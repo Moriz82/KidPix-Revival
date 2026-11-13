@@ -13,6 +13,8 @@ pub enum LibKind {
     Toons,
     Sounds,
     Stamps,
+    /// Paper textures (`Data/Tools/TextureMaps.MHK`); item id 0 = plain paper.
+    Paper,
 }
 
 impl LibKind {
@@ -23,6 +25,7 @@ impl LibKind {
             LibKind::Toons => "Animations",
             LibKind::Sounds => "Sounds",
             LibKind::Stamps => "Stamps",
+            LibKind::Paper => "Paper Texture",
         }
     }
     fn dir(self) -> &'static str {
@@ -32,6 +35,7 @@ impl LibKind {
             LibKind::Toons => "Libraries/Toons",
             LibKind::Sounds => "Libraries/Sounds",
             LibKind::Stamps => "Libraries/Stamps",
+            LibKind::Paper => "Data/Tools",
         }
     }
 }
@@ -54,6 +58,15 @@ pub struct LibDrawer {
 
 impl LibDrawer {
     pub fn open(assets: &Assets, kind: LibKind) -> Option<LibDrawer> {
+        if kind == LibKind::Paper {
+            let a = assets.archive(PAPER)?;
+            let mut items = vec![LibItem { id: 0, title: "Plain paper".into(), thumb: Some(plain_thumb()) }];
+            for id in a.ids(assets::T_BMP) {
+                let thumb = a.get(assets::T_BMP, id).and_then(|d| mohawk::decode_bitmap(d, None).ok()).map(|t| gfx::resize(&t, 48, 36));
+                items.push(LibItem { id, title: String::new(), thumb });
+            }
+            return Some(LibDrawer { kind, libs: vec![PathBuf::from(PAPER)], lib: 0, archive: Some((*a).clone()), items, page: 0 });
+        }
         let libs = assets.libraries(kind.dir());
         if libs.is_empty() {
             return None;
@@ -71,6 +84,9 @@ impl LibDrawer {
     }
 
     pub fn library_name(&self) -> String {
+        if self.kind == LibKind::Paper {
+            return String::new();
+        }
         self.libs
             .get(self.lib)
             .and_then(|p| p.file_stem())
@@ -79,6 +95,9 @@ impl LibDrawer {
     }
 
     pub fn switch(&mut self, delta: i32) {
+        if self.kind == LibKind::Paper {
+            return;
+        }
         let n = self.libs.len() as i32;
         self.lib = ((self.lib as i32 + delta).rem_euclid(n.max(1))) as usize;
         self.page = 0;
@@ -118,6 +137,9 @@ impl LibDrawer {
 
     pub fn ensure_thumbs(&mut self, start: usize, count: usize) {
         let kind = self.kind;
+        if kind == LibKind::Paper {
+            return;
+        }
         let Some(a) = &self.archive else { return };
         for item in self.items.iter_mut().skip(start).take(count) {
             if item.thumb.is_some() {
@@ -168,6 +190,14 @@ impl LibDrawer {
             .map(|t| knock_out_white(&gfx::resize(&t, t.width * 2, t.height * 2)));
         (thumb.into_iter().collect(), 12.0, None)
     }
+}
+
+pub const PAPER: &str = "Data/Tools/TextureMaps.MHK";
+
+fn plain_thumb() -> Image {
+    let mut t = Image::filled(48, 36, 0xffff_ffff);
+    gfx::stroke_rect(&mut t, 0, 0, 48, 36, 1, 0xff80_8080);
+    t
 }
 
 /// Stamps are 16-bit bitmaps on a white field; white becomes transparent.

@@ -22,6 +22,38 @@ impl Fonts {
         Fonts { faces }
     }
 
+    /// Add the operating system's UI font (for menus/dialogs, like the original's Win32 menus).
+    pub fn add_system_font(&mut self) -> Option<usize> {
+        let mut cands: Vec<std::path::PathBuf> = Vec::new();
+        if cfg!(target_os = "windows") {
+            let w = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+            for f in ["tahoma.ttf", "arial.ttf", "segoeui.ttf"] {
+                cands.push(std::path::Path::new(&w).join("Fonts").join(f));
+            }
+        } else if cfg!(target_os = "macos") {
+            for f in ["/System/Library/Fonts/Supplemental/Tahoma.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial.ttf", "/System/Library/Fonts/Geneva.ttf"] {
+                cands.push(f.into());
+            }
+        } else {
+            for d in ["/usr/share/fonts", "/usr/local/share/fonts", "/usr/share/fonts/truetype"] {
+                for name in ["DejaVuSans.ttf", "LiberationSans-Regular.ttf", "NotoSans-Regular.ttf", "Arial.ttf"] {
+                    if let Some(p) = find_file(std::path::Path::new(d), name, 3) {
+                        cands.push(p);
+                    }
+                }
+            }
+        }
+        for p in cands {
+            if let Ok(bytes) = std::fs::read(&p) {
+                if let Ok(font) = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
+                    self.faces.push(("System".into(), font));
+                    return Some(self.faces.len() - 1);
+                }
+            }
+        }
+        None
+    }
+
     pub fn is_empty(&self) -> bool {
         self.faces.is_empty()
     }
@@ -162,4 +194,22 @@ pub fn palette_colors() -> Vec<u32> {
         v.push(gfx::rgb(c.0, c.1, c.2));
     }
     v
+}
+
+fn find_file(dir: &std::path::Path, name: &str, depth: u32) -> Option<std::path::PathBuf> {
+    let p = dir.join(name);
+    if p.is_file() {
+        return Some(p);
+    }
+    if depth == 0 {
+        return None;
+    }
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        if e.path().is_dir() {
+            if let Some(f) = find_file(&e.path(), name, depth - 1) {
+                return Some(f);
+            }
+        }
+    }
+    None
 }
