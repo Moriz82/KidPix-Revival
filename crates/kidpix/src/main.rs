@@ -82,6 +82,19 @@ struct App {
     run: Option<Running>,
 }
 
+/// The Kid Pix Revival icon (our own artwork, `packaging/icons`) for the title bar and
+/// task bar; macOS takes the bundle's `.icns` instead.
+fn app_icon() -> Option<winit::window::Icon> {
+    let dec = png::Decoder::new(std::io::Cursor::new(include_bytes!("../../../packaging/icons/icon-256.png")));
+    let mut r = dec.read_info().ok()?;
+    let mut buf = vec![0; r.output_buffer_size()];
+    let info = r.next_frame(&mut buf).ok()?;
+    if info.color_type != png::ColorType::Rgba {
+        return None;
+    }
+    winit::window::Icon::from_rgba(buf[..info.buffer_size()].to_vec(), info.width, info.height).ok()
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.run.is_some() {
@@ -89,6 +102,7 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes()
             .with_title("Kid Pix Deluxe 3") // string table 128
+            .with_window_icon(app_icon())
             .with_inner_size(LogicalSize::new(W as f64 * 1.25, H as f64 * 1.25))
             .with_min_inner_size(LogicalSize::new(W as f64 / 2.0, H as f64 / 2.0));
         let window = Rc::new(el.create_window(attrs).expect("create window"));

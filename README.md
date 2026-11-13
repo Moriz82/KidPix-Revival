@@ -12,8 +12,18 @@ at runtime from the CD (or CD image) you own.
 
 ## Running it
 
-Build (Rust 1.80+; Linux also needs `libasound2-dev libxkbcommon-dev` or your distro's
-equivalents):
+Ready-made programs (from the GitHub Actions build, or `scripts/package.sh`):
+
+* **macOS:** `KidPixRevival-macOS.dmg` — drag **Kid Pix Revival.app** to Applications
+  (universal: Apple Silicon and Intel, macOS 11+). It is ad-hoc signed, so the first time
+  right-click → Open. It asks once for the microphone (sound recording, Sound Art).
+* **Windows:** `KidPixRevival-Windows.zip` — **kidpix-revival.exe** is a normal windowed
+  program (icon, version information, high-DPI aware); no console window.
+* **Linux:** `KidPixRevival-x86_64.AppImage` — make it executable and double-click it (or
+  use the `.tar.gz` with a `.desktop` file and icons).
+
+Building from source (Rust 1.80+; Linux also needs `libasound2-dev libxkbcommon-dev` or
+your distro's equivalents):
 
 ```sh
 cargo build --release -p kidpix
@@ -24,9 +34,9 @@ cargo build --release -p kidpix
 The first time it starts, Kid Pix Revival asks for your Kid Pix Deluxe 3 CD: pick the
 `.zip` or `.iso` image, or a folder (the CD itself, a copy of it, or an installed Kid Pix
 Deluxe 3). It copies the files it needs (about 320 MB) into a `game` folder next to the
-program — or, if that folder isn't writable, into your user data folder
-(`~/.local/share/KidPixRevival`, `%APPDATA%\KidPixRevival`,
-`~/Library/Application Support/KidPixRevival`). From then on it starts straight away and
+program — or, if that folder isn't writable (and always for the macOS app and the
+AppImage), into your user data folder (`~/.local/share/KidPixRevival`,
+`%APPDATA%\KidPixRevival`, `~/Library/Application Support/KidPixRevival`). From then on it starts straight away and
 you can delete the CD image.
 
 From the command line:
@@ -49,11 +59,17 @@ The hybrid CD image contains Mac resource forks next to the Windows files; the b
 importer skips them. (If you extract the `.iso` by hand, use `7z x -aoa`; `bsdtar`
 overwrites the real files with 4990-byte resource forks.)
 
-### Portable folder
+### Packages
 
-`scripts/package.sh [--windows] [--with-game]` builds `dist/KidPixRevival-<target>/` with
-the program (and, with `--with-game`, your imported `game` folder so the folder runs on its
-own). A folder made with `--with-game` contains your CD's files: keep it for yourself.
+`scripts/package.sh [--windows] [--with-game]` builds the native package of the machine
+it runs on into `dist/`: the macOS `.app` + `.dmg` (universal, ad-hoc signed; set
+`MACOS_SIGN_IDENTITY` to sign with a Developer ID), the Linux AppImage (needs
+`appimagetool`, or set `APPIMAGETOOL=`) plus a `.tar.gz`, or on Windows (Git Bash) the
+`.exe` folder and `.zip`; `--windows` also cross-builds the Windows `.exe` from Linux
+(mingw-w64). The icon is the project's own (`packaging/icons`, drawn by
+`scripts/make_icons.py`). With `--with-game` your imported `game` folder goes into the
+package so it runs without the CD — that package contains your CD's files: keep it for
+yourself. Tagging a commit `v…` makes the CI attach all three packages to a GitHub release.
 
 ## What works
 

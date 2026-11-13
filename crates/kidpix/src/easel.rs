@@ -2481,6 +2481,8 @@ impl Easel {
             let white = Image::filled(CANVAS_W, CANVAS_H, WHITE);
             crate::slideshow::transition(BIG_ERASE_FX[be.idx], k, &be.from, &white, &mut self.canvas.img);
             if k >= 1.0 {
+                // the effect ends on the blank page
+                self.canvas.img = white;
                 self.big_erase = None;
             }
         }
@@ -3299,6 +3301,16 @@ impl Easel {
     }
 
     /// Self-test: run an easel button command.
+    /// Self-test: start big eraser `i` (0–14, `BIG_ERASERS` order) at canvas point `at`.
+    pub fn test_big_erase(&mut self, i: usize, at: (f32, f32)) {
+        self.start_big_erase(i, at);
+    }
+
+    /// Self-test: whether a big eraser is still running.
+    pub fn test_big_erasing(&self) -> bool {
+        self.big_erase.is_some()
+    }
+
     pub fn test_command(&mut self, cmd: u16) {
         self.command(cmd);
     }
@@ -3377,7 +3389,7 @@ fn dashed(frame: &mut Image, a: (f32, f32), b: (f32, f32)) {
 
 
 /// Big erasers (tool ids 123..137) in panel order; names = KPD3.cfg sound sections.
-const BIG_ERASERS: [&str; 15] = [
+pub const BIG_ERASERS: [&str; 15] = [
     "Firecracker", "ClockFace", "IrisHeart", "IrisStar", "Windmill", "PageTear", "Spiral", "Implode", "Engulf", "Fade", "Explode",
     "Kaleidoscope", "Waterfall", "WipeRight", "Vanish",
 ];

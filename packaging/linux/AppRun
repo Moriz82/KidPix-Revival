@@ -1,0 +1,11 @@
+#!/bin/sh
+# AppImage entry point: run the bundled program; your imported CD data lives in the user
+# data folder (or a "game" folder next to the AppImage).
+HERE="$(dirname "$(readlink -f "$0")")"
+if [ -z "$KIDPIX_DATA" ] && [ -d "$HERE/usr/share/kidpix-revival-game" ]; then
+  export KIDPIX_DATA="$HERE/usr/share/kidpix-revival-game"
+fi
+if [ -n "$APPIMAGE" ] && [ -z "$KIDPIX_DATA" ] && [ -d "$(dirname "$APPIMAGE")/game" ]; then
+  export KIDPIX_DATA="$(dirname "$APPIMAGE")/game"
+fi
+exec "$HERE/usr/bin/kidpix-revival" "$@"

@@ -376,6 +376,7 @@ pub fn run(assets: Rc<Assets>, out: &Path) {
     run_kpx(e.assets_rc(), out);
     run_spell(e.assets_rc(), out);
     run_panels(e.assets_rc(), out);
+    run_effects(e.assets_rc(), out);
 }
 
 fn sshot(s: &crate::shell::Shell, out: &Path, name: &str) {
@@ -408,6 +409,21 @@ fn run_shell(assets: Rc<Assets>, out: &Path) {
     sshot(&s, out, "21_splash");
     s.key(Key::Escape);
     s.update(50.0);
+    // the untouched login dialog, as the original shows it on a fresh install (no users)
+    {
+        let empty = out.join("users_empty");
+        let _ = std::fs::remove_dir_all(&empty);
+        let _ = std::fs::create_dir_all(empty.join("Users"));
+        let mut s0 = crate::shell::Shell::with_users(empty, s.assets.clone(), Rc::new(Audio::silent()), true);
+        for _ in 0..60 {
+            s0.update(100.0);
+        }
+        s0.key(Key::Escape);
+        s0.update(50.0);
+        s0.mouse_move(780, 580);
+        s0.update(50.0);
+        sshot(&s0, out, "22a_login_fresh");
+    }
     for c in "Jamie".chars() {
         s.key(Key::Char(c));
     }
@@ -690,6 +706,101 @@ fn run_spell(assets: Rc<Assets>, out: &Path) {
     if crate::spell::Checker::new(&e.assets_rc().root, vec![]).uses_lexicon() {
         assert_eq!(fixed, "My dog likes the picture", "CD lexicon corrections");
     }
+}
+
+/// A busy test picture: colour bands, circles and a grid (shows every wipe's shape).
+fn effect_picture(w: u32, h: u32, seed: u32) -> Image {
+    let mut img = Image::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let band = ((x + y * 2 + seed * 40) / 38) % 6;
+            let c = [0xffe0_3030, 0xfff0_a020, 0xfff0_e040, 0xff40_b050, 0xff3070_e0, 0xff9040_d0][band as usize];
+            let grid = x % 50 < 2 || y % 50 < 2;
+            img.put(x as i32, y as i32, if grid { 0xff10_1010 } else { c });
+        }
+    }
+    for (cx, cy, r) in [(150, 120, 60), (430, 300, 90), (300, 220, 30)] {
+        for y in -r..=r {
+            for x in -r..=r {
+                if x * x + y * y <= r * r {
+                    img.put(cx + x, cy + y, 0xffff_ffff);
+                }
+            }
+        }
+    }
+    img
+}
+
+/// Every slide transition (the CD's 30 QuickTime effects) at 25 / 50 / 75 %, and every
+/// big eraser part-way, as contact sheets in `out/effects`.
+fn run_effects(assets: Rc<Assets>, out: &Path) {
+    use crate::slideshow::{transition, TRANSITIONS, TRANS_SOUNDS};
+    let dir = out.join("effects");
+    let _ = std::fs::create_dir_all(&dir);
+    let names = crate::slideshow::strl(&assets, TRANS_SOUNDS, 7500);
+    let fonts = crate::ui::Fonts::load(&[]);
+    let (tw, th) = (200u32, 151u32);
+    let a = effect_picture(600, 452, 0);
+    let b = gfx::resize(&effect_picture(600, 452, 3), 600, 452);
+    let b = {
+        // the incoming picture: same pattern, darker, so both sides are visible
+        let mut b = b;
+        for p in b.pixels.iter_mut() {
+            let (_, r, g, bb) = gfx::split(*p);
+            *p = gfx::rgb((r / 3) as u8, (g / 3) as u8, (bb / 2 + 60) as u8);
+        }
+        b
+    };
+    let cols = 2usize; // transitions per row, three frames each
+    let rows = TRANSITIONS.div_ceil(cols);
+    let mut sheet = Image::filled((cols as u32) * 3 * tw + 10, rows as u32 * (th + 14), 0xff30_3030);
+    let mut frame = Image::new(600, 452);
+    for k in 0..TRANSITIONS {
+        let (r, c) = (k / cols, k % cols);
+        for (j, t) in [0.25f32, 0.5, 0.75].into_iter().enumerate() {
+            transition(k, t, &a, &b, &mut frame);
+            let small = gfx::resize(&frame, tw, th);
+            gfx::blit(&mut sheet, &small, (c * 3 + j) as i32 * tw as i32 + if c > 0 { 10 } else { 0 }, (r as u32 * (th + 14) + 14) as i32);
+        }
+        let label = format!("{k}: {}", names.get(k).map(String::as_str).unwrap_or("?"));
+        fonts.draw(&mut sheet, crate::ui::UI_BITMAP, 11.0, (c * 3) as f32 * tw as f32 + if c > 0 { 12.0 } else { 2.0 }, (r as u32 * (th + 14) + 11) as f32, 0xffff_ffff, &label);
+    }
+    let p = dir.join("transitions.png");
+    crate::save_png(&p, &sheet).expect("write png");
+    eprintln!("wrote {}", p.display());
+
+    // Big erasers: each from the same picture, captured at ~40 % and ~80 % of its run.
+    let n = crate::easel::BIG_ERASERS.len();
+    let mut sheet = Image::filled(2 * tw + 10, n as u32 * (th + 14), 0xff30_3030);
+    for i in 0..n {
+        let mut e = Easel::new(assets.clone(), Rc::new(Audio::silent()));
+        e.canvas.img = a.clone();
+        e.test_big_erase(i, (300.0, 226.0));
+        let mut shots = Vec::new();
+        let mut t = 0.0;
+        for target in [400.0f32, 800.0] {
+            while t < target {
+                e.update(20.0);
+                t += 20.0;
+            }
+            shots.push(gfx::resize(&e.canvas.img, tw, th));
+        }
+        for (j, s) in shots.iter().enumerate() {
+            gfx::blit(&mut sheet, s, j as i32 * (tw as i32 + 10), (i as u32 * (th + 14) + 14) as i32);
+        }
+        let mut guard = 0;
+        while e.test_big_erasing() && guard < 400 {
+            e.update(50.0);
+            guard += 1;
+        }
+        let white = e.canvas.img.pixels.iter().all(|&p| p & 0xffffff == 0xffffff);
+        let label = format!("{i}: {}{}", crate::easel::BIG_ERASERS[i], if white { "" } else { "  (NOT WHITE AT END)" });
+        fonts.draw(&mut sheet, crate::ui::UI_BITMAP, 11.0, 2.0, (i as u32 * (th + 14) + 11) as f32, 0xffff_ffff, &label);
+        assert!(white, "big eraser {} leaves a white page", crate::easel::BIG_ERASERS[i]);
+    }
+    let p = dir.join("big_erasers.png");
+    crate::save_png(&p, &sheet).expect("write png");
+    eprintln!("wrote {}", p.display());
 }
 
 /// Every tool panel in each of its modes, cropped to the bottom strip (for side-by-side

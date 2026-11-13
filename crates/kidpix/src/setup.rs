@@ -81,6 +81,16 @@ pub fn locate(data: Option<PathBuf>, import_src: Option<PathBuf>) -> Option<Path
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("game"));
             candidates.push(dir.to_path_buf());
+            // macOS app bundle: Kid Pix Revival.app/Contents/MacOS/kidpix-revival — a
+            // "game" folder in Contents/Resources or next to the .app (portable copy)
+            if dir.ends_with("Contents/MacOS") {
+                if let Some(contents) = dir.parent() {
+                    candidates.push(contents.join("Resources/game"));
+                    if let Some(parent) = contents.parent().and_then(|app| app.parent()) {
+                        candidates.push(parent.join("game"));
+                    }
+                }
+            }
         }
     }
     if let Ok(cwd) = std::env::current_dir() {

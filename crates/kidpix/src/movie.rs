@@ -173,15 +173,26 @@ pub fn load_async(path: PathBuf) -> mpsc::Receiver<Result<Movie, String>> {
 
 #[cfg(test)]
 mod tests {
-    /// KIDPIX_MOVIE=<.mov> cargo test -p kidpix movie -- --ignored
+    /// The native decoder on a CD movie: `game/QTmovies/*.mov` (or KIDPIX_MOVIE=<.mov> with
+    /// the CD data two folders up). Skipped without the data.
     #[test]
-    #[ignore]
     fn decode_real_movie() {
-        let Ok(p) = std::env::var("KIDPIX_MOVIE") else { return };
-        let m = super::load(p.as_ref()).unwrap();
+        let p = match std::env::var("KIDPIX_MOVIE") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game/QTmovies/Cows.mov"),
+        };
+        let p = std::fs::canonicalize(&p).unwrap_or(p);
+        let Some(root) = p.parent().and_then(|d| d.parent()) else { return };
+        if !p.is_file() || crate::assets::resolve_ci(root, "INSTALL/QT4/QuickTime/QuickTimeAuthoring.qtx").is_none() {
+            eprintln!("no CD movie / QuickTimeAuthoring.qtx, skipping");
+            return;
+        }
+        super::set_game_root(root);
+        let m = super::load_native(&p).expect("native decode");
         assert!(m.frame_count() > 10);
         assert_eq!((m.width, m.height), (320, 240));
         let f = m.frame(m.frame_count() / 2);
         assert!(f.pixels.iter().any(|&p| p & 0xffffff != 0));
+        assert!(m.audio.as_ref().is_some_and(|a| a.channels == 2 && a.sample_rate == 44100));
     }
 }

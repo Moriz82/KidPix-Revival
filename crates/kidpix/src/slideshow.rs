@@ -453,9 +453,9 @@ fn star_radius(a: f32) -> f32 {
     let a0 = k * seg;
     let (r0, r1) = if k as i32 % 2 == 0 { (1.0, inner) } else { (inner, 1.0) };
     // Intersect the ray with the segment between the two vertices.
-    let p0 = (r0 * a0.sin(), r0 * a0.cos());
-    let p1 = (r1 * (a0 + seg).sin(), r1 * (a0 + seg).cos());
-    let d = (a.sin(), a.cos());
+    let p0 = (r0 * libm::sinf(a0), r0 * libm::cosf(a0));
+    let p1 = (r1 * libm::sinf(a0 + seg), r1 * libm::cosf(a0 + seg));
+    let d = (libm::sinf(a), libm::cosf(a));
     let e = (p1.0 - p0.0, p1.1 - p0.1);
     let den = d.0 * e.1 - d.1 * e.0;
     if den.abs() < 1e-6 {
@@ -533,7 +533,8 @@ fn build_field(kind: usize, w: u32, h: u32) -> Option<Vec<f32>> {
             let dy = fy - cy;
             let r = (dx * dx + dy * dy).sqrt();
             // 0 at 12 o'clock, clockwise.
-            let ang = dx.atan2(-dy).rem_euclid(TAU);
+            // libm (pure Rust) keeps the wipe shapes bit-identical on every OS
+            let ang = libm::atan2f(dx, -dy).rem_euclid(TAU);
             let d = match kind {
                 // Barn Door: SMPTE 21, vertical edges opening from the centre.
                 0 => dx.abs() / cx,
@@ -547,11 +548,12 @@ fn build_field(kind: usize, w: u32, h: u32) -> Option<Vec<f32>> {
                 8 => (dx.abs() / cx).max(dy.abs() / cy),
                 // Iris Star: 128 (five points).
                 9 => r / star_radius(ang).max(0.05),
-                // Jaws: 74, two zig-zag edges opening from the vertical centre line.
+                // Jaws: 74 (barnZigZagWipe horizontal), two zig-zag edges opening up and
+                // down from the horizontal centre line.
                 10 => {
-                    let period = hf / 6.0;
-                    let tri = ((fy / period).fract() - 0.5).abs() * 2.0;
-                    dx.abs() + tri * 30.0
+                    let period = wf / 8.0;
+                    let tri = ((fx / period).fract() - 0.5).abs() * 2.0;
+                    dy.abs() + tri * hf * 0.066
                 }
                 // Kaleidoscope: 102 diamond iris repeated 3×3.
                 11 => {
@@ -567,8 +569,12 @@ fn build_field(kind: usize, w: u32, h: u32) -> Option<Vec<f32>> {
                     let pos = if row % 2 == 0 { fx / wf } else { 1.0 - fx / wf };
                     (row as f32 + pos) / gr as f32
                 }
-                // Open Sesame: 47, two edges opening from the top-left/bottom-right diagonal.
-                13 => (fx / wf - fy / hf).abs(),
+                // Open Sesame: 47 (miscDiagonalWipe doubleBarnDoor), four wedges split
+                // along both diagonals and retract towards the four edges.
+                13 => (fx / wf - fy / hf).abs().min((fx / wf + fy / hf - 1.0).abs()),
+                // Spotlight: 231 (fanWipe top), a beam from the top centre that widens
+                // until it covers the picture.
+                21 => libm::atan2f(dx.abs(), fy) / (PI / 2.0),
                 // Spiral: 310, blocks in a clockwise spiral.
                 20 => {
                     let bx = ((fx / wf * gc as f32) as usize).min(gc - 1);
@@ -589,7 +595,7 @@ fn build_field(kind: usize, w: u32, h: u32) -> Option<Vec<f32>> {
                 25 => fy / hf,
                 // Wiper: 223, a blade pivoting at the bottom centre sweeping left to right.
                 26 => {
-                    let a = (hf - fy).atan2(fx - cx); // 0 = right, PI = left
+                    let a = libm::atan2f(hf - fy, fx - cx); // 0 = right, PI = left
                     1.0 - a.clamp(0.0, PI) / PI
                 }
                 // Wipe Right: 1.
@@ -599,7 +605,12 @@ fn build_field(kind: usize, w: u32, h: u32) -> Option<Vec<f32>> {
             v[(y * w + x) as usize] = d;
         }
     }
-    let max = v.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
+    let max = v.iter().cloned().filter(|d| d.is_finite()).fold(0.0f32, f32::max).max(1e-6);
+    for d in v.iter_mut() {
+        if !d.is_finite() {
+            *d = max;
+        }
+    }
     // Arrival times strictly above 0 so t = 0 shows only the old picture.
     let n = v.len() as f32;
     for (i, d) in v.iter_mut().enumerate() {
@@ -662,6 +673,10 @@ pub fn transition(kind: usize, t: f32, a: &Image, b: &Image, out: &mut Image) {
     } else {
         b
     };
+    if t >= 1.0 {
+        out.pixels.copy_from_slice(&b.pixels);
+        return;
+    }
     let (wi, hi) = (w as i32, h as i32);
     let get = |img: &Image, x: i32, y: i32| img.pixels[(y.clamp(0, hi - 1) * wi + x.clamp(0, wi - 1)) as usize];
     if let Some(f) = field(kind, w, h) {
@@ -679,16 +694,19 @@ pub fn transition(kind: usize, t: f32, a: &Image, b: &Image, out: &mut Image) {
         }
         return;
     }
-    let te = t * t * (3.0 - 2.0 * t);
+    // QuickTime tweens the effect percentage ('pcnt' 0→1) linearly
+    let te = t;
     match kind {
-        // Engulf: explode whose origin drifts out past the top-right corner (2nd tween 2,−2).
-        2 => explode(a, b, out, te, (2.0 * te, -2.0 * te), false),
+        // Engulf: explode whose centre moves from below the picture to above it
+        // (xcnt 0, ycnt tween 2 → −2).
+        2 => explode(a, b, out, te, (0.0, 2.0 - 4.0 * te), false),
         // Explode: the new picture grows out of the centre.
         3 => explode(a, b, out, te, (0.0, 0.0), false),
         // Implode: the old picture shrinks into the centre.
         5 => explode(a, b, out, te, (0.0, 0.0), true),
-        // Page Tear: explode from a point left of the picture moving up (tweens −2,2 → −2,0).
-        14 => explode(a, b, out, te, (-2.0, 2.0 - 2.0 * te), false),
+        // Page Tear: explode whose centre moves from beyond the top-left corner to the
+        // right edge (xcnt tween −2 → 2, ycnt tween −2 → 0).
+        14 => explode(a, b, out, te, (-2.0 + 4.0 * te, -2.0 + 2.0 * te), false),
         // Push: the new picture pushes the old one out to the left.
         15 => {
             let off = (te * w as f32) as i32;
@@ -713,21 +731,6 @@ pub fn transition(kind: usize, t: f32, a: &Image, b: &Image, out: &mut Image) {
                         19 | 28 if y >= hi - offy => get(b, x, y - (hi - offy)),
                         _ => get(a, x, y),
                     };
-                    out.pixels[(y * wi + x) as usize] = p;
-                }
-            }
-        }
-        // Spotlight: a light circle wanders in and opens up, darkening the old picture.
-        21 => {
-            let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
-            let maxr = (cx * cx + cy * cy).sqrt();
-            let sx = cx + (t * 6.0).cos() * cx * 0.5 * (1.0 - t);
-            let sy = cy + (t * 6.0).sin() * cy * 0.5 * (1.0 - t);
-            for y in 0..hi {
-                for x in 0..wi {
-                    let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-                    let d = ((fx - sx).powi(2) + (fy - sy).powi(2)).sqrt();
-                    let p = if d < te * maxr * 1.2 { get(b, x, y) } else { gfx::lerp(get(a, x, y), 0xff00_0000, (t * 160.0) as u32) };
                     out.pixels[(y * wi + x) as usize] = p;
                 }
             }
@@ -795,6 +798,26 @@ mod tests {
             transition(k, 1.0, &a, &b, &mut o);
             let blue = o.pixels.iter().filter(|&&p| p == 0xff0000ff).count();
             assert!(blue * 100 >= o.pixels.len() * 99, "kind {k} at 1: {blue}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+
+    /// Every transition starts on the old picture and ends exactly on the new one.
+    #[test]
+    fn transitions_start_and_finish() {
+        let a = Image::filled(600, 452, 0xff10_2030);
+        let b = Image::filled(600, 452, 0xffff_ffff);
+        let mut out = Image::new(600, 452);
+        for k in 0..TRANSITIONS {
+            transition(k, 0.0, &a, &b, &mut out);
+            assert!(out.pixels.iter().all(|&p| p == a.pixels[0]), "transition {k} at 0 %");
+            transition(k, 1.0, &a, &b, &mut out);
+            let left = out.pixels.iter().filter(|&&p| p != b.pixels[0]).count();
+            assert_eq!(left, 0, "transition {k} at 100 % leaves {left} old pixels");
         }
     }
 }

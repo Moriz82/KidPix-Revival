@@ -8,7 +8,10 @@ pub fn import_dest() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let in_cargo_target = dir.components().any(|c| c.as_os_str() == "target");
-            if !in_cargo_target && writable(dir) {
+            // never write into a macOS app bundle (it would break its signature) or an
+            // AppImage (read-only mount): those import into the user data folder
+            let in_bundle = dir.ends_with("Contents/MacOS") || std::env::var_os("APPIMAGE").is_some();
+            if !in_cargo_target && !in_bundle && writable(dir) {
                 return dir.join("game");
             }
         }

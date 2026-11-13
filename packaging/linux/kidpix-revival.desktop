@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Kid Pix Revival
+GenericName=Painting program for kids
+Comment=Plays your own Kid Pix Deluxe 3 CD on modern computers
+Exec=kidpix-revival
+Icon=kidpix-revival
+Terminal=false
+Categories=Graphics;RasterGraphics;Education;
+Keywords=paint;draw;kids;kid pix;

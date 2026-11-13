@@ -5,9 +5,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+build = "build.rs"
+
 [[bin]]
 name = "kidpix-revival"
 path = "src/main.rs"
+
+[build-dependencies]
+winresource = "0.1"
 
 [dependencies]
 mohawk = { path = "../mohawk" }
@@ -17,6 +22,7 @@ kp-kpx = { path = "../kp-kpx" }
 kp-brushes = { path = "../kp-brushes" }
 kp-lex = { path = "../kp-lex" }
 kp-qt = { path = "../kp-qt" }
+libm = "0.2"
 winit = "0.30"
 softbuffer = "0.4"
 cpal = "0.15"

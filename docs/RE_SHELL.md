@@ -643,7 +643,7 @@ all tween 0→1 (`twnt=3`). Index = STRL 7500 order:
 |---|---|---|---|
 | 0 | Barn Door | smpt (SMPTE wipe) | wpID 21 |
 | 1 | Clock Face | smp3 | wpID 201 |
-| 2 | Engulf | xplo | xcnt 0, 2nd tween (2,−2) |
+| 2 | Engulf | xplo | xcnt 0, ycnt tween 2 → −2 (centre rises from below to above) |
 | 3 | Explode | xplo | xcnt 0 ycnt 0 |
 | 4 | Fade | dslv (dissolve) | – |
 | 5 | Implode | mplo | xcnt 0 ycnt 0 |
@@ -655,7 +655,7 @@ all tween 0→1 (`twnt=3`). Index = STRL 7500 order:
 | 11 | Kaleidoscope | smp2 | wpID 102, hori 3 vert 3 (3×3 repeat), soft |
 | 12 | Lawnmower | smp4 | wpID 301, soft |
 | 13 | Open Sesame | smpt | wpID 47 |
-| 14 | Page Tear | xplo | extra tweens (−2,2)/(−2,0) |
+| 14 | Page Tear | xplo | xcnt tween −2 → 2, ycnt tween −2 → 0 |
 | 15 | Push | push | from 1 |
 | 16 | Slide Down | slid | angle 0° |
 | 17 | Slide Left | slid | 90° |
@@ -673,8 +673,17 @@ all tween 0→1 (`twnt=3`). Index = STRL 7500 order:
 | 29 | Zoom | zoom | zvar 1, zdst 5.0 |
 
 (`hori/vert` = 1, `widt` = 0, border colour black for all wipes.) The wpIDs are the
-standard SMPTE wipe codes; implement them natively. Transition duration is not in the
-files (QuickTime default; ~1 s [?]).
+standard SMPTE 258M / SMIL 2.0 wipe codes, implemented natively in `slideshow.rs`:
+1 bar left→right, 2 bar top→bottom, 21 vertical barn door, 41 diagonal from top-left,
+47 double barn door (four wedges along both diagonals), 74 horizontal zig-zag barn door
+(opens up and down), 101 rectangle iris, 102 diamond iris (3×3), 119 circle, 128 five-point
+star, 130 heart, 201 clock from 12, 207 four-blade pinwheel, 223 single sweep pivoting at
+the bottom, 231 fan from the top centre, 301 horizontal snake, 310 clockwise spiral,
+350 waterfall from the left. Explode/implode centres are in −1…1 picture units (beyond ±1
+= outside the picture). `pcnt` tweens linearly. Transition duration is not in the files
+(QuickTime default; ~1 s [?]). Every transition starts on the old picture and ends exactly
+on the new one (`transition_tests`); the shapes use the pure-Rust `libm` so they are
+bit-identical on every OS.
 
 ### 9.6 Slide-show background colours (table @0x580228, `{char* name; u8 r,g,b,0}`) [code+data]
 Values are **percent** (≥100 ⇒ 100 %); swatch art colours (RGB) given for exact rendering:
