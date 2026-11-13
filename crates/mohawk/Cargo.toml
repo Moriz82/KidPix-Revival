@@ -1,0 +1,12 @@
+[package]
+name = "mohawk"
+description = "Reader for Broderbund Mohawk archives (Kid Pix Deluxe 3 era) and their resources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zune-jpeg = "0.4"
+
+[dev-dependencies]
+png = "0.17"

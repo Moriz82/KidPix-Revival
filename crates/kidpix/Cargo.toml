@@ -1,0 +1,22 @@
+[package]
+name = "kidpix"
+description = "Kid Pix Deluxe 3 revival engine: runs the original data from your own CD on Windows, Linux and macOS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kidpix-revival"
+path = "src/main.rs"
+
+[dependencies]
+mohawk = { path = "../mohawk" }
+kp-import = { path = "../kp-import" }
+kp-swf = { path = "../kp-swf" }
+winit = "0.30"
+softbuffer = "0.4"
+cpal = "0.15"
+png = "0.17"
+rfd = "0.15"
+fontdue = "0.9"
+directories = "5"

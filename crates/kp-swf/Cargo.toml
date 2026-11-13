@@ -1,0 +1,15 @@
+[package]
+name = "kp-swf"
+description = "Renderer for the Flash (SWF) movies used as Kid Pix Deluxe 3 stickers and toons"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+miniz_oxide = "0.8"
+zune-jpeg = "0.4"
+
+[dev-dependencies]
+png = "0.17"

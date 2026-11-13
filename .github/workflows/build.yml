@@ -1,0 +1,43 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: kidpix-revival
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: kidpix-revival.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: kidpix-revival
+          - os: macos-13
+            target: x86_64-apple-darwin
+            bin: kidpix-revival
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Linux system libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --release --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build -p kidpix --release --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kidpix-revival-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.bin }}

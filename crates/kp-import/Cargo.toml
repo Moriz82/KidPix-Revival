@@ -1,0 +1,9 @@
+[package]
+name = "kp-import"
+description = "Find or import the user's own Kid Pix Deluxe 3 CD (folder, ISO or ZIP)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }

@@ -1,0 +1,9 @@
+/target
+*.zip
+*.iso
+/data/
+/kpdata/
+*.png
+!docs/**/*.png
+/game/
+/dist/
